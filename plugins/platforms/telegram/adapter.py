@@ -635,6 +635,9 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         # Interactive model picker state per chat
         self._model_picker_state: Dict[str, dict] = {}
+        # Transactional Zenos Runtime role picker state per chat. Unlike /model,
+        # selections remain drafts until the user taps Save.
+        self._wmodel_picker_state: Dict[str, dict] = {}
         # Approval button state: message_id → session_key
         self._approval_state: Dict[int, str] = {}
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
@@ -4813,6 +4816,411 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_model_picker failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
+    def _wmodel_main_text(self, state: dict) -> str:
+        lines = ["⚙ *Wmodel Configuration*", ""]
+        labels = {"host": "Host", "worker": "Worker", "boss": "Boss"}
+        current = state.get("current_roles", {})
+        draft = state.get("draft_roles", {})
+        for role in ("host", "worker", "boss"):
+            now = current.get(role, {})
+            nxt = draft.get(role, {})
+            now_model = now.get("model") or "unknown"
+            now_provider = now.get("provider") or "default"
+            lines.append(
+                f"Current {labels[role]} model: `{now_model}` from `{now_provider}`"
+            )
+            if (
+                nxt.get("model")
+                and (nxt.get("model") != now_model or nxt.get("provider") != now_provider)
+            ):
+                lines.append(
+                    f"→ Next {labels[role]} model: `{nxt['model']}` from "
+                    f"`{nxt.get('provider') or 'default'}`"
+                )
+        lines.extend([
+            "",
+            "Choose a role, then tap ✓ Save when the draft is ready.",
+            "Apply a saved preset with `/wmodel combo <name>`.",
+        ])
+        return "\n".join(lines)
+
+    def _build_wmodel_main_keyboard(self) -> "InlineKeyboardMarkup":
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Host", callback_data="wr:h"),
+                InlineKeyboardButton("Worker", callback_data="wr:w"),
+            ],
+            [InlineKeyboardButton("Boss", callback_data="wr:b")],
+            [
+                InlineKeyboardButton("✗", callback_data="wx"),
+                InlineKeyboardButton("✓ Save", callback_data="ws"),
+            ],
+        ])
+
+    def _build_wmodel_provider_keyboard(self, providers: list, page: int = 0) -> tuple:
+        """Build the provider page for a staged Runtime role selection."""
+        try:
+            from hermes_cli.models import group_providers
+        except Exception:
+            group_providers = None
+
+        by_slug = {p.get("slug"): p for p in providers}
+
+        def _button(provider):
+            count = provider.get("total_models", len(provider.get("models", [])))
+            return InlineKeyboardButton(
+                f"{provider['name']} ({count})",
+                callback_data=f"wp:{provider['slug']}",
+            )
+
+        buttons = []
+        if group_providers is not None:
+            for row in group_providers([p.get("slug") for p in providers]):
+                if row["kind"] == "group":
+                    members = [by_slug[item] for item in row["members"] if item in by_slug]
+                    count = sum(
+                        member.get("total_models", len(member.get("models", [])))
+                        for member in members
+                    )
+                    buttons.append(
+                        InlineKeyboardButton(
+                            f"{row['label']} ▸ ({count})",
+                            callback_data=f"wpg:{row['group_id']}",
+                        )
+                    )
+                else:
+                    provider = by_slug.get(row["slug"])
+                    if provider is not None:
+                        buttons.append(_button(provider))
+        else:
+            buttons = [_button(provider) for provider in providers]
+
+        page_size = self._PROVIDER_PAGE_SIZE
+        total = len(buttons)
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        page = max(0, min(page, total_pages - 1))
+        start = page * page_size
+        end = min(start + page_size, total)
+        page_buttons = buttons[start:end]
+        rows = [page_buttons[index : index + 2] for index in range(0, len(page_buttons), 2)]
+        if total_pages > 1:
+            nav = []
+            if page > 0:
+                nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"wpv:{page - 1}"))
+            nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="wn"))
+            if page < total_pages - 1:
+                nav.append(InlineKeyboardButton("Next ▶", callback_data=f"wpv:{page + 1}"))
+            rows.append(nav)
+        rows.append([
+            InlineKeyboardButton("◀ Roles", callback_data="wb"),
+            InlineKeyboardButton("✗", callback_data="wx"),
+        ])
+        page_info = f" ({start + 1}–{end} of {total})" if total_pages > 1 else ""
+        return InlineKeyboardMarkup(rows), page_info
+
+    def _build_wmodel_model_keyboard(self, models: list, page: int = 0) -> tuple:
+        page_size = self._MODEL_PAGE_SIZE
+        total = len(models)
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        page = max(0, min(page, total_pages - 1))
+        start = page * page_size
+        end = min(start + page_size, total)
+        buttons = []
+        for absolute_index, model_id in enumerate(models[start:end], start=start):
+            short = model_id.split("/")[-1] if "/" in model_id else model_id
+            if len(short) > 38:
+                short = short[:35] + "..."
+            buttons.append(
+                InlineKeyboardButton(short, callback_data=f"wm:{absolute_index}")
+            )
+        rows = [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
+        if total_pages > 1:
+            nav = []
+            if page > 0:
+                nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"wg:{page - 1}"))
+            nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="wn"))
+            if page < total_pages - 1:
+                nav.append(InlineKeyboardButton("Next ▶", callback_data=f"wg:{page + 1}"))
+            rows.append(nav)
+        rows.append([
+            InlineKeyboardButton("◀ Roles", callback_data="wb"),
+            InlineKeyboardButton("✗", callback_data="wx"),
+        ])
+        page_info = f" ({start + 1}–{end} of {total})" if total_pages > 1 else ""
+        return InlineKeyboardMarkup(rows), page_info
+
+    async def send_wmodel_picker(
+        self,
+        chat_id: str,
+        providers: list,
+        current_roles: dict,
+        runtime_session_id: str,
+        session_key: str,
+        on_save,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Open the transactional Host/Worker/Boss Runtime model picker."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        try:
+            state = {
+                "providers": providers,
+                "current_roles": {
+                    role: dict(current_roles.get(role, {}))
+                    for role in ("host", "worker", "boss")
+                },
+                "draft_roles": {
+                    role: dict(current_roles.get(role, {}))
+                    for role in ("host", "worker", "boss")
+                },
+                "runtime_session_id": runtime_session_id,
+                "session_key": session_key,
+                "on_save": on_save,
+                "provider_page": 0,
+            }
+            thread_id = metadata.get("thread_id") if metadata else None
+            reply_to_id = self._reply_to_message_id_for_send(
+                None, metadata, reply_to_mode=self._reply_to_mode
+            )
+            message = await self._send_message_with_thread_fallback(
+                chat_id=normalize_telegram_chat_id(chat_id),
+                text=self.format_message(self._wmodel_main_text(state)),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=self._build_wmodel_main_keyboard(),
+                reply_to_message_id=reply_to_id,
+                **self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                    reply_to_mode=self._reply_to_mode,
+                ),
+                **self._link_preview_kwargs(),
+            )
+            state["msg_id"] = message.message_id
+            self._wmodel_picker_state[str(chat_id)] = state
+            return SendResult(success=True, message_id=str(message.message_id))
+        except Exception as exc:
+            logger.warning("[%s] send_wmodel_picker failed: %s", self.name, exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def _show_wmodel_main(self, query, state: dict) -> None:
+        await query.edit_message_text(
+            text=self.format_message(self._wmodel_main_text(state)),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=self._build_wmodel_main_keyboard(),
+        )
+
+    async def _handle_wmodel_picker_callback(self, query, data: str, chat_id: str) -> None:
+        state = self._wmodel_picker_state.get(chat_id)
+        if not state:
+            await query.answer(text="Picker expired — use /wmodel again.")
+            return
+
+        role_codes = {"h": "host", "w": "worker", "b": "boss"}
+        role_labels = {"host": "Host", "worker": "Worker", "boss": "Boss"}
+
+        if data.startswith("wr:"):
+            role = role_codes.get(data[3:])
+            if not role:
+                await query.answer(text="Unknown Runtime role.")
+                return
+            state["selected_role"] = role
+            state["provider_page"] = 0
+            keyboard, page_info = self._build_wmodel_provider_keyboard(
+                state["providers"], 0
+            )
+            await query.edit_message_text(
+                text=self.format_message(
+                    f"⚙ *Wmodel Configuration*\n\n"
+                    f"Role: *{role_labels[role]}*\n"
+                    f"Select a provider:{page_info}"
+                ),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=keyboard,
+            )
+            await query.answer()
+            return
+
+        if data.startswith("wp:"):
+            provider_slug = data[3:]
+            provider = next(
+                (item for item in state["providers"] if item.get("slug") == provider_slug),
+                None,
+            )
+            if not provider:
+                await query.answer(text="Provider not found.")
+                return
+            state["selected_provider"] = provider_slug
+            state["selected_provider_name"] = provider.get("name", provider_slug)
+            state["model_list"] = provider.get("models", [])
+            state["model_page"] = 0
+            keyboard, page_info = self._build_wmodel_model_keyboard(
+                state["model_list"], 0
+            )
+            await query.edit_message_text(
+                text=self.format_message(
+                    f"⚙ *Wmodel Configuration*\n\n"
+                    f"Role: *{role_labels.get(state.get('selected_role'), 'Runtime')}*\n"
+                    f"Provider: *{state['selected_provider_name']}*{page_info}\n"
+                    f"Select a model:"
+                ),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=keyboard,
+            )
+            await query.answer()
+            return
+
+        if data.startswith("wpg:"):
+            group_id = data[4:]
+            try:
+                from hermes_cli.models import PROVIDER_GROUPS
+                label, _description, member_slugs = PROVIDER_GROUPS.get(
+                    group_id, ("", "", [])
+                )
+            except Exception:
+                label, member_slugs = "", []
+            by_slug = {item.get("slug"): item for item in state["providers"]}
+            members = [by_slug[item] for item in member_slugs if item in by_slug]
+            if not members:
+                await query.answer(text="Provider family not found.")
+                return
+            rows = []
+            buttons = []
+            for provider in members:
+                count = provider.get(
+                    "total_models", len(provider.get("models", []))
+                )
+                buttons.append(
+                    InlineKeyboardButton(
+                        f"{provider['name']} ({count})",
+                        callback_data=f"wp:{provider['slug']}",
+                    )
+                )
+            rows.extend(
+                buttons[index : index + 2]
+                for index in range(0, len(buttons), 2)
+            )
+            rows.append([
+                InlineKeyboardButton("◀ Roles", callback_data="wb"),
+                InlineKeyboardButton("✗", callback_data="wx"),
+            ])
+            await query.edit_message_text(
+                text=self.format_message(
+                    f"⚙ *Wmodel Configuration*\n\n"
+                    f"Provider family: *{label or group_id}*\n\n"
+                    f"Select a provider:"
+                ),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=InlineKeyboardMarkup(rows),
+            )
+            await query.answer()
+            return
+
+        if data.startswith("wpv:"):
+            try:
+                page = int(data[4:])
+            except ValueError:
+                await query.answer(text="Invalid page.")
+                return
+            state["provider_page"] = page
+            keyboard, page_info = self._build_wmodel_provider_keyboard(
+                state["providers"], page
+            )
+            role = state.get("selected_role")
+            await query.edit_message_text(
+                text=self.format_message(
+                    f"⚙ *Wmodel Configuration*\n\n"
+                    f"Role: *{role_labels.get(role, 'Runtime')}*\n"
+                    f"Select a provider:{page_info}"
+                ),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=keyboard,
+            )
+            await query.answer()
+            return
+
+        if data.startswith("wg:"):
+            try:
+                page = int(data[3:])
+            except ValueError:
+                await query.answer(text="Invalid page.")
+                return
+            state["model_page"] = page
+            keyboard, page_info = self._build_wmodel_model_keyboard(
+                state.get("model_list", []), page
+            )
+            await query.edit_message_text(
+                text=self.format_message(
+                    f"⚙ *Wmodel Configuration*\n\n"
+                    f"Role: *{role_labels.get(state.get('selected_role'), 'Runtime')}*\n"
+                    f"Provider: *{state.get('selected_provider_name', '')}*{page_info}\n"
+                    f"Select a model:"
+                ),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=keyboard,
+            )
+            await query.answer()
+            return
+
+        if data.startswith("wm:"):
+            try:
+                index = int(data[3:])
+            except ValueError:
+                await query.answer(text="Invalid model.")
+                return
+            models = state.get("model_list", [])
+            role = state.get("selected_role")
+            if not role or index < 0 or index >= len(models):
+                await query.answer(text="Invalid model selection.")
+                return
+            state["draft_roles"][role] = {
+                "model": models[index],
+                "provider": state.get("selected_provider") or "default",
+            }
+            await self._show_wmodel_main(query, state)
+            await query.answer(text=f"{role_labels[role]} draft updated")
+            return
+
+        if data == "wb":
+            await self._show_wmodel_main(query, state)
+            await query.answer()
+            return
+
+        if data == "ws":
+            callback = state.get("on_save")
+            if not callback:
+                await query.answer(text="Picker expired.")
+                return
+            try:
+                result_text = await callback(
+                    chat_id,
+                    state["runtime_session_id"],
+                    state["draft_roles"],
+                )
+                await query.edit_message_text(
+                    text=self.format_message(result_text),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=None,
+                )
+                await query.answer(text="Runtime models saved")
+                self._wmodel_picker_state.pop(chat_id, None)
+            except Exception as exc:
+                logger.warning("Wmodel save failed: %s", exc)
+                await query.answer(text="Save failed.", show_alert=True)
+            return
+
+        if data == "wx":
+            self._wmodel_picker_state.pop(chat_id, None)
+            await query.edit_message_text(
+                text="Wmodel selection cancelled. No Runtime models were changed.",
+                reply_markup=None,
+            )
+            await query.answer()
+            return
+
+        await query.answer()
+
     _PROVIDER_PAGE_SIZE = 10
     _MODEL_PAGE_SIZE = 8
 
@@ -5302,6 +5710,13 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        # --- Transactional Runtime model picker callbacks ---
+        if data.startswith(("wr:", "wp:", "wpg:", "wpv:", "wm:", "wg:", "wb", "ws", "wx", "wn")):
+            chat_id = str(query.message.chat_id) if query.message else None
+            if chat_id:
+                await self._handle_wmodel_picker_callback(query, data, chat_id)
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):

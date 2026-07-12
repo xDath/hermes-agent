@@ -354,3 +354,94 @@ class TestTelegramModelPicker:
         assert len(call_log) == 2
         assert call_log[0]["message_thread_id"] == 99999
         assert "message_thread_id" not in call_log[1] or call_log[1]["message_thread_id"] is None
+
+
+class TestTelegramWmodelPicker:
+    @pytest.mark.asyncio
+    async def test_selection_is_staged_until_save(self):
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=303))
+        save = AsyncMock(return_value="✓ Wmodel saved")
+        current = {
+            "host": {"model": "grok", "provider": "etla-router"},
+            "worker": {"model": "build", "provider": "etla-router"},
+            "boss": {"model": "codex", "provider": "etla-router"},
+        }
+        providers = [{
+            "slug": "etla-router",
+            "name": "Etla Router",
+            "models": ["grok", "grok-fast"],
+            "total_models": 2,
+        }]
+
+        result = await adapter.send_wmodel_picker(
+            chat_id="12345",
+            providers=providers,
+            current_roles=current,
+            runtime_session_id="hermes-test",
+            session_key="telegram:12345",
+            on_save=save,
+        )
+        assert result.success is True
+
+        query = AsyncMock()
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        await adapter._handle_wmodel_picker_callback(query, "wr:h", "12345")
+        await adapter._handle_wmodel_picker_callback(query, "wp:etla-router", "12345")
+        await adapter._handle_wmodel_picker_callback(query, "wm:1", "12345")
+
+        save.assert_not_awaited()
+        state = adapter._wmodel_picker_state["12345"]
+        assert state["current_roles"]["host"]["model"] == "grok"
+        assert state["draft_roles"]["host"]["model"] == "grok-fast"
+        main_text = query.edit_message_text.call_args[1]["text"]
+        assert "Next Host model" in main_text
+
+        await adapter._handle_wmodel_picker_callback(query, "ws", "12345")
+
+        save.assert_awaited_once_with(
+            "12345",
+            "hermes-test",
+            {
+                "host": {"model": "grok-fast", "provider": "etla-router"},
+                "worker": {"model": "build", "provider": "etla-router"},
+                "boss": {"model": "codex", "provider": "etla-router"},
+            },
+        )
+        assert "12345" not in adapter._wmodel_picker_state
+
+    @pytest.mark.asyncio
+    async def test_cancel_discards_draft_without_save(self):
+        adapter = _make_adapter()
+        save = AsyncMock(return_value="saved")
+        adapter._wmodel_picker_state["12345"] = {
+            "providers": [],
+            "current_roles": {
+                "host": {"model": "grok", "provider": "etla-router"},
+                "worker": {"model": "build", "provider": "etla-router"},
+                "boss": {"model": "codex", "provider": "etla-router"},
+            },
+            "draft_roles": {
+                "host": {"model": "another", "provider": "etla-router"},
+                "worker": {"model": "build", "provider": "etla-router"},
+                "boss": {"model": "codex", "provider": "etla-router"},
+            },
+            "runtime_session_id": "hermes-test",
+            "session_key": "telegram:12345",
+            "on_save": save,
+        }
+        query = AsyncMock()
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        await adapter._handle_wmodel_picker_callback(query, "wx", "12345")
+
+        save.assert_not_awaited()
+        assert "12345" not in adapter._wmodel_picker_state
+        assert "No Runtime models were changed" in query.edit_message_text.call_args[1]["text"]

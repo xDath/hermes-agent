@@ -1396,6 +1396,171 @@ class GatewaySlashCommandsMixin:
             getattr(getattr(event, "source", None), "platform", None),
         )
 
+    async def _handle_wmodel_command(self, event: MessageEvent) -> Optional[str]:
+        """Manage staged Zenos Runtime Host/Worker/Boss models per chat session."""
+        from gateway.run import _load_gateway_config
+        from gateway.zenos_runtime import (
+            RUNTIME_ROLES,
+            get_runtime_models,
+            list_runtime_combos,
+            role_config_from_response,
+            runtime_session_id,
+            save_runtime_models,
+        )
+        from hermes_cli.model_switch import list_picker_providers
+
+        source = await asyncio.to_thread(
+            self._normalize_source_for_session_key, event.source
+        )
+        session_key = self._session_key_for_source(source)
+        runtime_id = runtime_session_id(session_key)
+        raw_args = event.get_command_args().strip()
+
+        try:
+            model_data = await asyncio.to_thread(get_runtime_models, runtime_id)
+            current_roles = role_config_from_response(model_data)
+        except Exception as exc:
+            return f"Wmodel error: {exc}"
+
+        def _status_text(roles: dict, prefix: str = "Wmodel Configuration") -> str:
+            labels = {"host": "Host", "worker": "Worker", "boss": "Boss"}
+            lines = [prefix, ""]
+            for role in RUNTIME_ROLES:
+                entry = roles.get(role, {})
+                lines.append(
+                    f"Current {labels[role]} model: {entry.get('model') or 'unknown'} "
+                    f"from {entry.get('provider') or 'default'}"
+                )
+            return "\n".join(lines)
+
+        if raw_args:
+            try:
+                tokens = shlex.split(raw_args)
+            except ValueError as exc:
+                return f"Wmodel error: {exc}"
+            if not tokens:
+                return _status_text(current_roles)
+
+            if tokens[0].lower() == "combo":
+                if len(tokens) < 2:
+                    try:
+                        combos = await asyncio.to_thread(list_runtime_combos)
+                    except Exception as exc:
+                        return f"Wmodel error: {exc}"
+                    names = ", ".join(combo.get("name", "") for combo in combos) or "none"
+                    return f"Runtime combos: {names}\nUse /wmodel combo <name>"
+                combo_name = tokens[1]
+                try:
+                    combos = await asyncio.to_thread(list_runtime_combos)
+                    combo = next(
+                        (item for item in combos if item.get("name") == combo_name),
+                        None,
+                    )
+                    if not combo:
+                        return f"Runtime combo not found: {combo_name}"
+                    roles = combo.get("roles") or {}
+                    await asyncio.to_thread(save_runtime_models, runtime_id, roles)
+                    return _status_text(roles, f"Runtime combo {combo_name} saved")
+                except Exception as exc:
+                    return f"Wmodel error: {exc}"
+
+            aliases = {"h": "host", "w": "worker", "b": "boss"}
+            role = aliases.get(tokens[0].lower(), tokens[0].lower())
+            if role not in RUNTIME_ROLES:
+                return (
+                    "Usage: /wmodel, /wmodel host|worker|boss <model> "
+                    "[--provider name], or /wmodel combo <name>"
+                )
+            if len(tokens) < 2:
+                return f"Missing model for {role}."
+            model = tokens[1]
+            provider = current_roles[role].get("provider") or "etla-router"
+            if "--provider" in tokens:
+                provider_index = tokens.index("--provider")
+                if provider_index + 1 >= len(tokens):
+                    return "--provider requires a value."
+                provider = tokens[provider_index + 1]
+            next_roles = {
+                item: dict(current_roles[item]) for item in RUNTIME_ROLES
+            }
+            next_roles[role] = {"model": model, "provider": provider}
+            try:
+                await asyncio.to_thread(save_runtime_models, runtime_id, next_roles)
+                return _status_text(next_roles, "Wmodel saved")
+            except Exception as exc:
+                return f"Wmodel error: {exc}"
+
+        adapter = self.adapters.get(source.platform)
+        has_picker = (
+            adapter is not None
+            and getattr(type(adapter), "send_wmodel_picker", None) is not None
+        )
+        if not has_picker:
+            return (
+                f"{_status_text(current_roles)}\n\n"
+                "Set one role with /wmodel host|worker|boss <model> --provider <name>.\n"
+                "Apply a saved preset with /wmodel combo <name>."
+            )
+
+        cfg = {}
+        user_providers = None
+        custom_providers = None
+        try:
+            cfg = _load_gateway_config() or {}
+            user_providers = cfg.get("providers")
+            try:
+                from hermes_cli.config import get_compatible_custom_providers
+                custom_providers = get_compatible_custom_providers(cfg)
+            except Exception:
+                custom_providers = cfg.get("custom_providers")
+        except Exception:
+            pass
+
+        host = current_roles["host"]
+        model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+        current_base_url = model_cfg.get("base_url", "") if isinstance(model_cfg, dict) else ""
+        try:
+            providers = await asyncio.to_thread(
+                list_picker_providers,
+                current_provider=host.get("provider") or "etla-router",
+                current_base_url=current_base_url,
+                current_model=host.get("model") or "",
+                user_providers=user_providers,
+                custom_providers=custom_providers,
+                max_models=50,
+                include_moa=True,
+            )
+        except Exception:
+            providers = []
+        if not providers:
+            return f"{_status_text(current_roles)}\n\nNo model providers are currently available."
+
+        async def _save_wmodel(
+            _chat_id: str,
+            selected_runtime_id: str,
+            draft_roles: dict,
+        ) -> str:
+            await asyncio.to_thread(
+                save_runtime_models, selected_runtime_id, draft_roles
+            )
+            return _status_text(draft_roles, "✓ Wmodel saved for this session")
+
+        metadata = self._thread_metadata_for_source(
+            source, self._reply_anchor_for_event(event)
+        )
+        result = await adapter.send_wmodel_picker(
+            chat_id=source.chat_id,
+            providers=providers,
+            current_roles=current_roles,
+            runtime_session_id=runtime_id,
+            session_key=session_key,
+            on_save=_save_wmodel,
+            metadata=metadata,
+        )
+        if result.success:
+            return None
+        return f"Wmodel picker failed: {result.error or 'unknown error'}"
+
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model.
 
@@ -1470,6 +1635,17 @@ class GatewaySlashCommandsMixin:
         # (#30479).
         source = await asyncio.to_thread(self._normalize_source_for_session_key, source)
         session_key = self._session_key_for_source(source)
+        from gateway.zenos_runtime import runtime_session_id, save_runtime_host
+        _runtime_session_id = runtime_session_id(session_key)
+
+        async def _sync_runtime_host(model: str, provider: str) -> None:
+            try:
+                await asyncio.to_thread(
+                    save_runtime_host, _runtime_session_id, model, provider
+                )
+            except Exception as exc:
+                logger.debug("Runtime Host model sync failed: %s", exc)
+
         override = self._session_model_overrides.get(session_key, {})
         if override:
             current_model = override.get("model", current_model)
@@ -1673,6 +1849,10 @@ class GatewaySlashCommandsMixin:
                                 save_config(_persist_cfg)
                             except Exception as e:
                                 logger.warning("Failed to persist model switch: %s", e)
+
+                        await _sync_runtime_host(
+                            result.new_model, result.target_provider
+                        )
 
                         # Build confirmation text
                         plabel = result.provider_label or result.target_provider
@@ -1923,6 +2103,8 @@ class GatewaySlashCommandsMixin:
                     save_config(cfg)
                 except Exception as e:
                     logger.warning("Failed to persist model switch: %s", e)
+
+            await _sync_runtime_host(result.new_model, result.target_provider)
 
             # Build confirmation message with full metadata
             provider_label = result.provider_label or result.target_provider
