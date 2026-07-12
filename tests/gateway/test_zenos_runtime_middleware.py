@@ -56,6 +56,16 @@ def test_infer_turn_context_marks_code_mutation_and_live_verification_hints():
     assert context["intent"] in {"execute", "mutate"}
 
 
+def test_infer_turn_context_marks_explicit_boss_requests_without_matching_casual_boss_mentions():
+    requested = infer_turn_context(
+        "coba tanya agent boss ada ga caranya supaya private RPC lebih dekat dengan chain"
+    )
+    casual = infer_turn_context("boss gue nanya soal jadwal meeting")
+
+    assert requested["userRequestedBoss"] is True
+    assert casual["userRequestedBoss"] is False
+
+
 def test_execution_receipt_exposes_real_role_invocation_and_skips():
     receipt = format_execution_receipt({
         "pipeline": "verified_path",

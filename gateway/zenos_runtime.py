@@ -238,6 +238,12 @@ def infer_turn_context(
     verification_terms = (
         "verify", "pastikan", "cek bener", "are you sure", "yakin", "test", "uji",
     )
+    boss_request_terms = (
+        "tanya agent boss", "tanya boss", "panggil agent boss", "panggil boss",
+        "minta agent boss", "minta boss", "suruh agent boss", "suruh boss",
+        "boss review", "review sama boss", "ask agent boss", "ask the boss",
+        "ask boss", "consult the boss", "escalate to boss",
+    )
     fresh_terms = (
         "latest", "terbaru", "hari ini", "sekarang", "current", "news", "harga",
         "weather", "jadwal", "score", "status live",
@@ -262,6 +268,7 @@ def infer_turn_context(
         "hasLogs": any(term in lower for term in log_terms),
         "hasCodeChangeIntent": bool(has_code and has_mutation),
         "userRequestedVerification": any(term in lower for term in verification_terms),
+        "userRequestedBoss": any(term in lower for term in boss_request_terms),
         "estimatedContextTokens": estimated_tokens,
         "confidence": 0.75,
         "intent": intent,

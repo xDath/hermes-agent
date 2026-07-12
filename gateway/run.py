@@ -19724,6 +19724,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "inputTokens": max(0, int(response.get("input_tokens") or 0)),
                             "outputTokens": max(0, int(response.get("output_tokens") or 0)),
                         },
+                        "hostDurationMs": max(
+                            0,
+                            int((time.time() - _notify_start) * 1000),
+                        ),
                     }
                     _postflight = await asyncio.to_thread(
                         _zenos_gateway_postflight,
