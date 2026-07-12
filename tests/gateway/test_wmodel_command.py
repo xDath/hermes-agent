@@ -1,6 +1,7 @@
 """Focused tests for the transactional Zenos Runtime `/wmodel` command."""
 
 import types
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -35,6 +36,7 @@ def _runner(adapter=None):
     )
     runner._thread_metadata_for_source = lambda *_args, **_kwargs: {}
     runner._reply_anchor_for_event = lambda _event: None
+    runner._apply_wmodel_host_model = AsyncMock()
     return runner
 
 
@@ -81,7 +83,8 @@ async def test_bare_wmodel_opens_transactional_picker(monkeypatch):
     )
     monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {"providers": {}})
 
-    result = await _runner(adapter)._handle_wmodel_command(_event("/wmodel"))
+    runner = _runner(adapter)
+    result = await runner._handle_wmodel_command(_event("/wmodel"))
 
     assert result is None
     assert adapter.kwargs["current_roles"] == CURRENT
@@ -95,6 +98,7 @@ async def test_bare_wmodel_opens_transactional_picker(monkeypatch):
     )
 
     assert saved == [(adapter.kwargs["runtime_session_id"], draft)]
+    runner._apply_wmodel_host_model.assert_awaited_once()
     assert "Wmodel saved" in confirmation
     assert "build-fast" in confirmation
 
@@ -112,7 +116,63 @@ async def test_combo_command_applies_three_roles(monkeypatch):
         lambda sid, roles: saved.append((sid, roles)) or {"ok": True},
     )
 
-    result = await _runner()._handle_wmodel_command(_event("/wmodel combo coding"))
+    runner = _runner()
+    result = await runner._handle_wmodel_command(_event("/wmodel combo coding"))
 
     assert "Runtime combo coding saved" in result
     assert saved and saved[0][1] == CURRENT
+    runner._apply_wmodel_host_model.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_wmodel_host_write_through_updates_the_actual_hermes_session(monkeypatch):
+    from hermes_cli.model_switch import ModelSwitchResult
+
+    runner = object.__new__(GatewayRunner)
+    runner._session_model_overrides = {}
+    runner.session_store = MagicMock()
+    runner._evict_cached_agent = MagicMock()
+    runner._resolve_session_agent_runtime = lambda **_kwargs: (
+        "old-host",
+        {
+            "provider": "etla-router",
+            "base_url": "http://router.test/v1",
+            "api_key": "test-key",
+        },
+    )
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_config",
+        lambda: {"providers": {"etla-router": {}}},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.switch_model",
+        lambda **_kwargs: ModelSwitchResult(
+            success=True,
+            new_model="grok-next",
+            target_provider="etla-router",
+            provider_changed=False,
+            api_key="test-key",
+            base_url="http://router.test/v1",
+            api_mode="chat_completions",
+            provider_label="Etla Router",
+            is_global=False,
+        ),
+    )
+
+    source = _event("/wmodel").source
+    await runner._apply_wmodel_host_model(
+        source=source,
+        session_key="agent:main:telegram:dm:5072082650",
+        model="grok-next",
+        provider="etla-router",
+    )
+
+    override = runner._session_model_overrides[
+        "agent:main:telegram:dm:5072082650"
+    ]
+    assert override["model"] == "grok-next"
+    assert override["provider"] == "etla-router"
+    runner.session_store.set_model_override.assert_called_once()
+    runner._evict_cached_agent.assert_called_once_with(
+        "agent:main:telegram:dm:5072082650"
+    )

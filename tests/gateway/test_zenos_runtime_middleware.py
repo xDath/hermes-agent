@@ -1,0 +1,81 @@
+"""Unit tests for the native Hermes↔Zenos Runtime turn bridge helpers."""
+
+from gateway.zenos_runtime import (
+    compact_history,
+    format_execution_receipt,
+    infer_turn_context,
+    middleware_settings,
+    new_turn_id,
+    runtime_session_id,
+)
+
+
+def test_middleware_settings_are_fail_open_and_bounded():
+    settings = middleware_settings({
+        "zenos_runtime": {
+            "enabled": True,
+            "timeout_seconds": 9999,
+            "max_history_chars": 999999,
+            "receipt": "full",
+        }
+    })
+
+    assert settings["enabled"] is True
+    assert settings["fail_open"] is True
+    assert settings["timeout_seconds"] == 600.0
+    assert settings["max_history_chars"] == 120000
+    assert settings["receipt"] == "full"
+
+
+def test_compact_history_keeps_recent_user_and_assistant_text_without_tool_payloads():
+    history = [
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "tool", "content": "secret raw tool output"},
+        {"role": "user", "content": "latest question"},
+        {"role": "assistant", "content": [{"type": "text", "text": "latest answer"}]},
+    ]
+
+    compact = compact_history(history, 80)
+
+    assert "latest question" in compact
+    assert "latest answer" in compact
+    assert "secret raw tool output" not in compact
+
+
+def test_infer_turn_context_marks_code_mutation_and_live_verification_hints():
+    context = infer_turn_context(
+        "Fix bug API ini, test sampai bener, lalu cek status live sekarang",
+        workspace_root="/tmp/repo",
+    )
+
+    assert context["hasFiles"] is True
+    assert context["hasCodeChangeIntent"] is True
+    assert context["userRequestedVerification"] is True
+    assert context["requiresFreshData"] is True
+    assert context["intent"] in {"execute", "mutate"}
+
+
+def test_execution_receipt_exposes_real_role_invocation_and_skips():
+    receipt = format_execution_receipt({
+        "pipeline": "verified_path",
+        "host": {"invoked": True, "model": "grok", "provider": "etla-router"},
+        "worker": {"invoked": True, "model": "build", "ok": True},
+        "verifier": {"invoked": True, "model": "grok", "verdict": "pass", "ok": True},
+        "boss": {"invoked": False},
+        "transformed": False,
+    })
+
+    assert "Host grok" in receipt
+    assert "Worker build" in receipt
+    assert "Verifier grok/pass" in receipt
+    assert "Boss skipped" in receipt
+
+
+def test_runtime_and_turn_ids_are_stable_or_unique_as_required():
+    assert runtime_session_id("same-session") == runtime_session_id("same-session")
+    assert runtime_session_id("same-session") != runtime_session_id("other-session")
+    first = new_turn_id("session-1")
+    second = new_turn_id("session-1")
+    assert first != second
+    assert first.startswith("session-1_")

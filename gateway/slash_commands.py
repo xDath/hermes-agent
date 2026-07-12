@@ -1396,6 +1396,67 @@ class GatewaySlashCommandsMixin:
             getattr(getattr(event, "source", None), "platform", None),
         )
 
+    async def _apply_wmodel_host_model(
+        self,
+        *,
+        source,
+        session_key: str,
+        model: str,
+        provider: str,
+    ) -> None:
+        """Apply the `/wmodel` Host slot to the actual Hermes session.
+
+        Runtime role config alone is not enough: without this write-through,
+        `/wmodel` changes what the dashboard says while the gateway keeps using
+        the old Host. Resolve the provider exactly like `/model`, persist only a
+        session override, and evict the cached agent so the next turn really
+        starts on the selected Host.
+        """
+        from gateway.run import _load_gateway_config
+        from hermes_cli.model_switch import switch_model as _switch_model
+
+        cfg = _load_gateway_config() or {}
+        current_model, current_runtime = self._resolve_session_agent_runtime(
+            source=source,
+            session_key=session_key,
+            user_config=cfg,
+        )
+        user_providers = cfg.get("providers")
+        try:
+            from hermes_cli.config import get_compatible_custom_providers
+            custom_providers = get_compatible_custom_providers(cfg)
+        except Exception:
+            custom_providers = cfg.get("custom_providers")
+        result = await asyncio.to_thread(
+            _switch_model,
+            raw_input=model,
+            current_provider=str((current_runtime or {}).get("provider") or ""),
+            current_model=str(current_model or ""),
+            current_base_url=str((current_runtime or {}).get("base_url") or ""),
+            current_api_key=str((current_runtime or {}).get("api_key") or ""),
+            is_global=False,
+            explicit_provider=provider,
+            user_providers=user_providers,
+            custom_providers=custom_providers,
+        )
+        if not result.success:
+            raise RuntimeError(result.error_message or f"Could not switch Hermes Host to {model}")
+        if not hasattr(self, "_session_model_overrides"):
+            self._session_model_overrides = {}
+        override = {
+            "model": result.new_model,
+            "provider": result.target_provider,
+            "api_key": result.api_key,
+            "base_url": result.base_url,
+            "api_mode": result.api_mode,
+        }
+        self._session_model_overrides[session_key] = override
+        try:
+            self.session_store.set_model_override(session_key, override)
+        except Exception:
+            logger.debug("Failed to persist /wmodel Host override", exc_info=True)
+        self._evict_cached_agent(session_key)
+
     async def _handle_wmodel_command(self, event: MessageEvent) -> Optional[str]:
         """Manage staged Zenos Runtime Host/Worker/Boss models per chat session."""
         from gateway.run import _load_gateway_config
@@ -1421,6 +1482,30 @@ class GatewaySlashCommandsMixin:
             current_roles = role_config_from_response(model_data)
         except Exception as exc:
             return f"Wmodel error: {exc}"
+
+        async def _save_roles_and_sync_host(roles: dict) -> None:
+            await asyncio.to_thread(save_runtime_models, runtime_id, roles)
+            host = roles.get("host") or {}
+            try:
+                await self._apply_wmodel_host_model(
+                    source=source,
+                    session_key=session_key,
+                    model=str(host.get("model") or ""),
+                    provider=str(host.get("provider") or ""),
+                )
+            except Exception:
+                # Keep Runtime and Hermes from advertising different Host
+                # selections when provider resolution fails.
+                try:
+                    await asyncio.to_thread(
+                        save_runtime_models, runtime_id, current_roles
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to roll back Runtime roles after Hermes Host sync failure",
+                        exc_info=True,
+                    )
+                raise
 
         def _status_text(roles: dict, prefix: str = "Wmodel Configuration") -> str:
             labels = {"host": "Host", "worker": "Worker", "boss": "Boss"}
@@ -1459,7 +1544,7 @@ class GatewaySlashCommandsMixin:
                     if not combo:
                         return f"Runtime combo not found: {combo_name}"
                     roles = combo.get("roles") or {}
-                    await asyncio.to_thread(save_runtime_models, runtime_id, roles)
+                    await _save_roles_and_sync_host(roles)
                     return _status_text(roles, f"Runtime combo {combo_name} saved")
                 except Exception as exc:
                     return f"Wmodel error: {exc}"
@@ -1485,7 +1570,7 @@ class GatewaySlashCommandsMixin:
             }
             next_roles[role] = {"model": model, "provider": provider}
             try:
-                await asyncio.to_thread(save_runtime_models, runtime_id, next_roles)
+                await _save_roles_and_sync_host(next_roles)
                 return _status_text(next_roles, "Wmodel saved")
             except Exception as exc:
                 return f"Wmodel error: {exc}"
@@ -1540,9 +1625,9 @@ class GatewaySlashCommandsMixin:
             selected_runtime_id: str,
             draft_roles: dict,
         ) -> str:
-            await asyncio.to_thread(
-                save_runtime_models, selected_runtime_id, draft_roles
-            )
+            if selected_runtime_id != runtime_id:
+                raise RuntimeError("Wmodel session changed while the picker was open")
+            await _save_roles_and_sync_host(draft_roles)
             return _status_text(draft_roles, "✓ Wmodel saved for this session")
 
         metadata = self._thread_metadata_for_source(

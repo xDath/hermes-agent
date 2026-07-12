@@ -72,6 +72,7 @@ def _make_runner():
     runner.session_store = SimpleNamespace(
         get_or_create_session=lambda source: SimpleNamespace(session_id="session-1"),
         load_transcript=lambda session_id: [],
+        rewrite_transcript=MagicMock(return_value=True),
     )
     runner._get_or_create_gateway_honcho = lambda session_key: (None, None)
     runner._enrich_message_with_vision = AsyncMock(return_value="ENRICHED")
@@ -206,6 +207,134 @@ async def test_run_agent_passes_priority_processing_to_gateway_agent(monkeypatch
     assert result["final_response"] == "ok"
     assert _CapturingAgent.last_init["service_tier"] == "priority"
     assert _CapturingAgent.last_init["request_overrides"] == {"service_tier": "priority"}
+
+
+@pytest.mark.asyncio
+async def test_run_agent_executes_native_zenos_preflight_and_postflight(monkeypatch, tmp_path):
+    _install_fake_agent(monkeypatch)
+    runner = _make_runner()
+    runtime_kwargs = {
+        "provider": "etla-router",
+        "api_mode": "chat_completions",
+        "base_url": "http://router.test/v1",
+        "api_key": "test-key",
+    }
+    runner._resolve_session_agent_runtime = lambda **_kwargs: ("grok", runtime_kwargs)
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {
+            "zenos_runtime": {
+                "enabled": True,
+                "receipt": "concise",
+                "disable_streaming_when_verified": True,
+            }
+        },
+    )
+    monkeypatch.setattr(gateway_run, "_load_gateway_runtime_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "grok")
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: runtime_kwargs)
+
+    import hermes_cli.tools_config as tools_config
+    monkeypatch.setattr(tools_config, "_get_platform_tools", lambda *_args: {"core"})
+
+    preflight_payloads = []
+    postflight_payloads = []
+
+    def fake_preflight(payload, **_kwargs):
+        preflight_payloads.append(payload)
+        return {
+            "ok": True,
+            "runId": "gateway-test-run",
+            "sessionId": "hermes_test_session",
+            "turnId": payload["turnId"],
+            "decision": {
+                "pipelineMode": "verified_path",
+                "useVerifier": True,
+            },
+            "holdFinalDelivery": True,
+            "hostContext": "Worker build found bounded evidence for this turn.",
+            "receipt": {
+                "worker": {"invoked": True},
+                "boss": {"invoked": False},
+            },
+        }
+
+    def fake_postflight(payload, **_kwargs):
+        postflight_payloads.append(payload)
+        return {
+            "ok": True,
+            "finalAnswer": "verified Runtime answer",
+            "transformed": True,
+            "receipt": {
+                "pipeline": "verified_path",
+                "host": {"invoked": True, "model": "grok"},
+                "worker": {"invoked": True, "model": "build", "ok": True},
+                "verifier": {
+                    "invoked": True,
+                    "model": "grok",
+                    "verdict": "pass",
+                    "ok": True,
+                },
+                "boss": {"invoked": False},
+                "transformed": True,
+            },
+        }
+
+    monkeypatch.setattr("gateway.zenos_runtime.gateway_preflight", fake_preflight)
+    monkeypatch.setattr("gateway.zenos_runtime.gateway_postflight", fake_postflight)
+
+    def fake_run_conversation(
+        self,
+        user_message,
+        conversation_history=None,
+        task_id=None,
+        persist_user_message=None,
+        persist_user_timestamp=None,
+        **_kwargs,
+    ):
+        type(self).last_run = {
+            "user_message": user_message,
+            "persist_user_message": persist_user_message,
+        }
+        return {
+            "final_response": "unverified Host draft",
+            "messages": [
+                {"role": "user", "content": persist_user_message or user_message},
+                {"role": "assistant", "content": "unverified Host draft"},
+            ],
+            "api_calls": 1,
+            "completed": True,
+        }
+
+    monkeypatch.setattr(_CapturingAgent, "run_conversation", fake_run_conversation)
+
+    result = await runner._run_agent(
+        message="fix bug ini dan test sampai bener",
+        context_prompt="",
+        history=[],
+        source=_make_source(),
+        session_id="session-1",
+        session_key="agent:main:telegram:dm:12345",
+    )
+
+    assert preflight_payloads
+    assert preflight_payloads[0]["request"] == "fix bug ini dan test sampai bener"
+    assert "Worker build found bounded evidence" in _CapturingAgent.last_run["user_message"]
+    assert _CapturingAgent.last_run["persist_user_message"] == "fix bug ini dan test sampai bener"
+    assert postflight_payloads[0]["draft"] == "unverified Host draft"
+    assert result["final_response"].startswith("verified Runtime answer")
+    assert "Worker build" in result["final_response"]
+    assert "Verifier grok/pass" in result["final_response"]
+    runner.session_store.rewrite_transcript.assert_called_once()
+    rewritten = runner.session_store.rewrite_transcript.call_args.args[1]
+    assert rewritten[-1]["content"] == "verified Runtime answer"
+    assert rewritten[-2]["content"] == "fix bug ini dan test sampai bener"
+    assert "Worker build found bounded evidence" not in rewritten[-2]["content"]
 
 
 @pytest.mark.asyncio

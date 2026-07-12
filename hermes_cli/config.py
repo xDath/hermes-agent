@@ -987,6 +987,19 @@ DEFAULT_CONFIG = {
     # sessions (no live client) so accumulated agents don't pile up under memory
     # pressure. Reopening one re-resumes it from disk. 0/null disables.
     "max_live_sessions": 16,
+    # Native Zenos Runtime turn middleware. Disabled by default upstream;
+    # profiles opt in explicitly. The API credential remains in the profile
+    # secret environment, never in config.yaml.
+    "zenos_runtime": {
+        "enabled": False,
+        "url": "http://127.0.0.1:3090",
+        "fail_open": True,
+        "receipt": "concise",  # off | concise | full
+        "timeout_seconds": 180,
+        "max_history_chars": 16000,
+        "disable_streaming_when_verified": True,
+        "report_failures": True,
+    },
     "agent": {
         "max_turns": 90,
         # Inactivity timeout for gateway agent execution (seconds).

@@ -16944,6 +16944,115 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
 
+        # Native Zenos Runtime turn middleware.  This is a real execution edge,
+        # not a prompt-only protocol: every enabled gateway turn is persisted in
+        # Runtime, deterministic routing decides which roles are needed, Worker
+        # and Boss may run before Hermes Host, and Verifier/Boss postflight runs
+        # before final delivery.  Fail-open keeps chat available if the local
+        # sidecar is temporarily unavailable.
+        _zenos_turn = None
+        _zenos_settings = None
+        _zenos_host_model = ""
+        _zenos_host_provider = ""
+        _zenos_original_message = message
+        try:
+            from gateway.zenos_runtime import (
+                compact_history as _zenos_compact_history,
+                gateway_preflight as _zenos_gateway_preflight,
+                infer_turn_context as _zenos_infer_turn_context,
+                middleware_settings as _zenos_middleware_settings,
+                new_turn_id as _zenos_new_turn_id,
+                runtime_session_id as _zenos_runtime_session_id,
+            )
+
+            _zenos_settings = _zenos_middleware_settings(user_config)
+            if _zenos_settings.get("enabled"):
+                _zenos_host_model, _zenos_host_runtime = await asyncio.to_thread(
+                    self._resolve_session_agent_runtime,
+                    source=source,
+                    session_key=session_key,
+                    user_config=user_config,
+                )
+                _zenos_host_provider = str(
+                    (_zenos_host_runtime or {}).get("provider") or "default"
+                )
+                _workspace_root = ""
+                _workspace_candidate = os.getenv("TERMINAL_CWD", "").strip()
+                if _workspace_candidate:
+                    try:
+                        _workspace_path = Path(_workspace_candidate).expanduser().resolve()
+                        if _workspace_path.is_dir() and any(
+                            (_workspace_path / marker).exists()
+                            for marker in (".git", "package.json", "pyproject.toml", "Cargo.toml", "go.mod")
+                        ):
+                            _workspace_root = str(_workspace_path)
+                    except Exception:
+                        _workspace_root = ""
+                _runtime_id = _zenos_runtime_session_id(session_key or session_id)
+                _turn_id = _zenos_new_turn_id(session_id)
+                _routing_hints = _zenos_infer_turn_context(
+                    message,
+                    history=history,
+                    workspace_root=_workspace_root,
+                )
+                _preflight_payload = {
+                    "request": message,
+                    "sessionId": _runtime_id,
+                    "turnId": _turn_id,
+                    "platform": source.platform.value if source.platform else "gateway",
+                    "host": {
+                        "model": str(_zenos_host_model or "unknown"),
+                        "provider": _zenos_host_provider,
+                    },
+                    "context": _zenos_compact_history(
+                        history,
+                        int(_zenos_settings.get("max_history_chars") or 0),
+                    ),
+                    "workspaceRoot": _workspace_root or None,
+                    **_routing_hints,
+                }
+                # Remove None so strict Runtime schemas only see declared values.
+                _preflight_payload = {
+                    key: value for key, value in _preflight_payload.items()
+                    if value is not None
+                }
+                _zenos_turn = await asyncio.to_thread(
+                    _zenos_gateway_preflight,
+                    _preflight_payload,
+                    base_url=str(_zenos_settings.get("url") or ""),
+                    timeout=float(_zenos_settings.get("timeout_seconds") or 180),
+                )
+                _host_context = str((_zenos_turn or {}).get("hostContext") or "").strip()
+                if _host_context:
+                    # Keep the internal brief ephemeral: persist only the real
+                    # user text, while injecting the bounded Runtime packet into
+                    # this turn's user message (cache-safe current-turn context).
+                    if persist_user_message is None:
+                        persist_user_message = _zenos_original_message
+                    message = f"{message}\n\n{_host_context}"
+                logger.info(
+                    "Zenos native preflight: session=%s run=%s pipeline=%s worker=%s verifier=%s boss=%s",
+                    _runtime_id,
+                    (_zenos_turn or {}).get("runId"),
+                    ((_zenos_turn or {}).get("decision") or {}).get("pipelineMode"),
+                    ((_zenos_turn or {}).get("receipt") or {}).get("worker", {}).get("invoked"),
+                    ((_zenos_turn or {}).get("decision") or {}).get("useVerifier"),
+                    ((_zenos_turn or {}).get("receipt") or {}).get("boss", {}).get("invoked"),
+                )
+        except Exception as _zenos_preflight_error:
+            logger.exception("Zenos native preflight failed: %s", _zenos_preflight_error)
+            if _zenos_settings and not _zenos_settings.get("fail_open", True):
+                return {
+                    "final_response": (
+                        "⚠️ Zenos Runtime preflight gagal dan profile ini dikonfigurasi fail-closed. "
+                        f"Detail: {_zenos_preflight_error}"
+                    ),
+                    "messages": [],
+                    "api_calls": 0,
+                    "tools": [],
+                    "failed": True,
+                }
+
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
         agent_cfg_local = user_config.get("agent") or {}
@@ -17959,6 +18068,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _plat_streaming is None
                 else bool(_plat_streaming)
             )
+            if (
+                _zenos_turn
+                and bool((_zenos_turn or {}).get("holdFinalDelivery"))
+                and bool((_zenos_settings or {}).get("disable_streaming_when_verified", True))
+            ):
+                # Never stream an unverified final draft. Progress/interim
+                # commentary may still be shown, but the answer itself waits for
+                # Runtime Verifier/Boss postflight.
+                _streaming_enabled = False
             _want_stream_deltas = _streaming_enabled
             _want_interim_messages = interim_assistant_messages_enabled
             _want_interim_consumer = _want_interim_messages
@@ -19574,6 +19692,128 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Fallback activated on a successful run — evict cached
                     # agent so the next message retries the primary model.
                     self._evict_cached_agent(session_key)
+
+            # Native Zenos Runtime postflight.  This runs after Hermes Host has
+            # finished using tools, but before any normal/queued delivery.  The
+            # Runtime can verify, escalate, or revise the candidate.  A concise
+            # execution receipt is appended only to the delivered text (not the
+            # model transcript).  When Runtime changes the actual answer, rewrite
+            # the canonical transcript and evict the cached agent so the next turn
+            # resumes from the verified answer rather than the discarded draft.
+            if _zenos_turn and isinstance(response, dict):
+                try:
+                    from gateway.zenos_runtime import (
+                        bounded_tool_summary as _zenos_bounded_tool_summary,
+                        format_execution_receipt as _zenos_format_execution_receipt,
+                        gateway_postflight as _zenos_gateway_postflight,
+                    )
+
+                    _candidate_answer = str(response.get("final_response") or "")
+                    _postflight_payload = {
+                        "sessionId": str((_zenos_turn or {}).get("sessionId") or ""),
+                        "runId": str((_zenos_turn or {}).get("runId") or ""),
+                        "turnId": str((_zenos_turn or {}).get("turnId") or ""),
+                        "draft": _candidate_answer,
+                        "host": {
+                            "model": str(response.get("model") or _zenos_host_model or "unknown"),
+                            "provider": _zenos_host_provider or "default",
+                        },
+                        "toolSummary": _zenos_bounded_tool_summary(response.get("tools")),
+                        "failed": bool(response.get("failed")),
+                        "hostUsage": {
+                            "inputTokens": max(0, int(response.get("input_tokens") or 0)),
+                            "outputTokens": max(0, int(response.get("output_tokens") or 0)),
+                        },
+                    }
+                    _postflight = await asyncio.to_thread(
+                        _zenos_gateway_postflight,
+                        _postflight_payload,
+                        base_url=str((_zenos_settings or {}).get("url") or ""),
+                        timeout=float((_zenos_settings or {}).get("timeout_seconds") or 180),
+                    )
+                    _verified_answer = str(
+                        (_postflight or {}).get("finalAnswer") or _candidate_answer
+                    )
+                    _answer_changed = _verified_answer != _candidate_answer
+                    if _answer_changed:
+                        response["final_response"] = _verified_answer
+                        response["response_transformed"] = True
+                        _messages = response.get("messages")
+                        if isinstance(_messages, list):
+                            _assistant_replaced = False
+                            for _message in reversed(_messages):
+                                if not isinstance(_message, dict):
+                                    continue
+                                if (
+                                    not _assistant_replaced
+                                    and _message.get("role") == "assistant"
+                                    and not _message.get("tool_calls")
+                                ):
+                                    _message["content"] = _verified_answer
+                                    _assistant_replaced = True
+                                    continue
+                                if _assistant_replaced and _message.get("role") == "user":
+                                    # Never persist the ephemeral Runtime brief
+                                    # that was appended only for this Host turn.
+                                    _message["content"] = _zenos_original_message
+                                    break
+                            _transcript_session_id = str(
+                                response.get("session_id") or session_id
+                            )
+                            if _transcript_session_id:
+                                _rewrite_ok = self.session_store.rewrite_transcript(
+                                    _transcript_session_id,
+                                    _messages,
+                                )
+                                if not _rewrite_ok:
+                                    logger.warning(
+                                        "Zenos verified answer could not be written to canonical transcript for %s",
+                                        _transcript_session_id,
+                                    )
+                        self._evict_cached_agent(session_key)
+
+                    _receipt_text = _zenos_format_execution_receipt(
+                        (_postflight or {}).get("receipt"),
+                        str((_zenos_settings or {}).get("receipt") or "concise"),
+                    )
+                    if _receipt_text:
+                        response["final_response"] = (
+                            f"{str(response.get('final_response') or '')}\n\n"
+                            f"────────\n{_receipt_text}"
+                        )
+                        response["response_transformed"] = True
+                    response["zenos_runtime"] = _postflight
+                    logger.info(
+                        "Zenos native postflight: session=%s run=%s transformed=%s verifier=%s boss=%s",
+                        _postflight_payload["sessionId"],
+                        _postflight_payload["runId"],
+                        _answer_changed,
+                        (((_postflight or {}).get("receipt") or {}).get("verifier") or {}).get("verdict"),
+                        (((_postflight or {}).get("receipt") or {}).get("boss") or {}).get("verdict"),
+                    )
+                except Exception as _zenos_postflight_error:
+                    logger.exception("Zenos native postflight failed: %s", _zenos_postflight_error)
+                    if not bool((_zenos_settings or {}).get("fail_open", True)):
+                        response["final_response"] = (
+                            "⚠️ Zenos Runtime postflight gagal dan profile ini dikonfigurasi fail-closed. "
+                            f"Detail: {_zenos_postflight_error}"
+                        )
+                        response["failed"] = True
+                        response["response_transformed"] = True
+                    elif bool((_zenos_settings or {}).get("report_failures", True)):
+                        response["final_response"] = (
+                            f"{str(response.get('final_response') or '')}\n\n"
+                            "────────\nRuntime · unavailable · Host response delivered fail-open"
+                        )
+                        response["response_transformed"] = True
+
+                if isinstance(result_holder[0], dict):
+                    result_holder[0]["final_response"] = response.get("final_response")
+                    result_holder[0]["response_transformed"] = response.get(
+                        "response_transformed", False
+                    )
+                    if response.get("zenos_runtime") is not None:
+                        result_holder[0]["zenos_runtime"] = response.get("zenos_runtime")
 
             # Check if we were interrupted OR have a queued message (/queue).
             result = result_holder[0]
