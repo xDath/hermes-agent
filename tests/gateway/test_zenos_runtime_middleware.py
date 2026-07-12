@@ -99,7 +99,7 @@ def test_infer_turn_context_marks_explicit_boss_requests_without_matching_casual
 def test_execution_receipt_exposes_real_role_invocation_and_skips():
     receipt = format_execution_receipt({
         "pipeline": "verified_path",
-        "host": {"invoked": True, "model": "grok", "provider": "etla-router"},
+        "host": {"invoked": True, "model": "grok", "provider": "etla-router", "plannerInvoked": True},
         "worker": {"invoked": True, "model": "build", "ok": True},
         "verifier": {"invoked": True, "model": "grok", "verdict": "pass", "ok": True},
         "boss": {"invoked": False},
@@ -107,6 +107,7 @@ def test_execution_receipt_exposes_real_role_invocation_and_skips():
     })
 
     assert "Host grok" in receipt
+    assert "plan+final" in receipt
     assert "Worker build" in receipt
     assert "Verifier grok/pass" in receipt
     assert "Boss skipped" in receipt

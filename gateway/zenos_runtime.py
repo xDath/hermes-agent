@@ -372,6 +372,8 @@ def format_execution_receipt(receipt: Mapping[str, Any] | None, mode: str = "con
         verdict = str(entry.get("verdict") or "").strip()
         ok = entry.get("ok")
         suffix = f"/{verdict}" if verdict else ""
+        if role == "host" and entry.get("plannerInvoked"):
+            suffix += " · plan+final"
         if ok is False:
             suffix += " ✕"
         elif role != "host":
