@@ -1,13 +1,43 @@
 """Unit tests for the native Hermes↔Zenos Runtime turn bridge helpers."""
 
 from gateway.zenos_runtime import (
+    agent_usage_snapshot,
     compact_history,
     format_execution_receipt,
     infer_turn_context,
     middleware_settings,
     new_turn_id,
     runtime_session_id,
+    usage_delta,
 )
+
+
+def test_turn_usage_delta_separates_current_turn_from_session_totals():
+    class Agent:
+        session_input_tokens = 1000
+        session_output_tokens = 200
+        session_cache_read_tokens = 5000
+        session_cache_write_tokens = 50
+        session_reasoning_tokens = 75
+
+    agent = Agent()
+    before = agent_usage_snapshot(agent)
+    agent.session_input_tokens += 117
+    agent.session_output_tokens += 23
+    agent.session_cache_read_tokens += 900
+    agent.session_cache_write_tokens += 0
+    agent.session_reasoning_tokens += 9
+
+    delta = usage_delta(before, agent_usage_snapshot(agent))
+
+    assert delta == {
+        "inputTokens": 117,
+        "outputTokens": 23,
+        "cacheReadTokens": 900,
+        "cacheWriteTokens": 0,
+        "reasoningTokens": 9,
+        "totalTokens": 1040,
+    }
 
 
 def test_middleware_settings_are_fail_open_and_bounded():

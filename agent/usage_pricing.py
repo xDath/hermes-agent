@@ -871,6 +871,13 @@ def normalize_usage(
         cache_read_tokens = _to_int(getattr(details, "cached_tokens", 0) if details else 0)
         if not cache_read_tokens:
             cache_read_tokens = _to_int(getattr(response_usage, "cache_read_input_tokens", 0))
+        if not cache_read_tokens:
+            # 9Router and a few OpenAI-compatible proxies expose the cache-read
+            # bucket as top-level ``cached_tokens`` instead of the standard
+            # ``prompt_tokens_details.cached_tokens`` object. Treat it as the
+            # same bucket so cached prompt tokens are not charged again as
+            # fresh input in Hermes session accounting.
+            cache_read_tokens = _to_int(getattr(response_usage, "cached_tokens", 0))
         cache_write_tokens = _to_int(
             getattr(details, "cache_write_tokens", 0) if details else 0
         )

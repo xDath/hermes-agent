@@ -22,6 +22,36 @@ DEFAULT_RUNTIME_URL = "http://127.0.0.1:3090"
 DEFAULT_ROUTER_URL = "http://127.0.0.1:20128"
 RUNTIME_ROLES = ("host", "worker", "boss")
 DEFAULT_MIDDLEWARE_TIMEOUT = 180.0
+_USAGE_COUNTERS = {
+    "inputTokens": "session_input_tokens",
+    "outputTokens": "session_output_tokens",
+    "cacheReadTokens": "session_cache_read_tokens",
+    "cacheWriteTokens": "session_cache_write_tokens",
+    "reasoningTokens": "session_reasoning_tokens",
+}
+
+
+def agent_usage_snapshot(agent: Any) -> Dict[str, int]:
+    """Capture monotonic agent session counters at one turn boundary."""
+    return {
+        key: max(0, int(getattr(agent, attribute, 0) or 0))
+        for key, attribute in _USAGE_COUNTERS.items()
+    }
+
+
+def usage_delta(before: Mapping[str, Any], after: Mapping[str, Any]) -> Dict[str, int]:
+    """Return usage attributable to one turn, never cumulative session totals."""
+    result = {
+        key: max(0, int(after.get(key, 0) or 0) - int(before.get(key, 0) or 0))
+        for key in _USAGE_COUNTERS
+    }
+    result["totalTokens"] = (
+        result["inputTokens"]
+        + result["cacheReadTokens"]
+        + result["cacheWriteTokens"]
+        + result["outputTokens"]
+    )
+    return result
 
 
 def runtime_session_id(session_key: str) -> str:

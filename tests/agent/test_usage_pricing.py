@@ -86,6 +86,20 @@ def test_normalize_usage_openai_reads_top_level_cache_read_when_details_missing(
     assert normalized.input_tokens == 200
 
 
+def test_normalize_usage_openai_reads_9router_top_level_cached_tokens():
+    usage = SimpleNamespace(
+        prompt_tokens=231371,
+        completion_tokens=351,
+        cached_tokens=229888,
+    )
+
+    normalized = normalize_usage(usage, provider="custom", api_mode="chat_completions")
+
+    assert normalized.cache_read_tokens == 229888
+    assert normalized.input_tokens == 1483
+    assert normalized.output_tokens == 351
+
+
 def test_normalize_usage_openai_prefers_prompt_tokens_details_over_top_level():
     """When both prompt_tokens_details and top-level Anthropic fields are
     present, we prefer the OpenAI-standard nested fields. Top-level Anthropic

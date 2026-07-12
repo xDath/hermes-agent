@@ -18877,6 +18877,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"history.]"
                 )
 
+            _zenos_usage_before = None
+            if _zenos_turn:
+                from gateway.zenos_runtime import agent_usage_snapshot as _zenos_agent_usage_snapshot
+                _zenos_usage_before = _zenos_agent_usage_snapshot(agent)
+
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
@@ -18929,6 +18934,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+                if _zenos_turn and _zenos_usage_before is not None:
+                    from gateway.zenos_runtime import usage_delta as _zenos_usage_delta
+                    result["zenos_turn_usage"] = _zenos_usage_delta(
+                        _zenos_usage_before,
+                        _zenos_agent_usage_snapshot(agent),
+                    )
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
@@ -19709,6 +19720,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
 
                     _candidate_answer = str(response.get("final_response") or "")
+                    _turn_usage = response.get("zenos_turn_usage")
+                    if not isinstance(_turn_usage, dict):
+                        _turn_usage = {
+                            "inputTokens": max(0, int(response.get("input_tokens") or 0)),
+                            "outputTokens": max(0, int(response.get("output_tokens") or 0)),
+                            "cacheReadTokens": max(0, int(response.get("cache_read_tokens") or 0)),
+                            "cacheWriteTokens": max(0, int(response.get("cache_write_tokens") or 0)),
+                            "reasoningTokens": max(0, int(response.get("reasoning_tokens") or 0)),
+                        }
                     _postflight_payload = {
                         "sessionId": str((_zenos_turn or {}).get("sessionId") or ""),
                         "runId": str((_zenos_turn or {}).get("runId") or ""),
@@ -19721,8 +19741,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "toolSummary": _zenos_bounded_tool_summary(response.get("tools")),
                         "failed": bool(response.get("failed")),
                         "hostUsage": {
-                            "inputTokens": max(0, int(response.get("input_tokens") or 0)),
-                            "outputTokens": max(0, int(response.get("output_tokens") or 0)),
+                            "inputTokens": max(0, int(_turn_usage.get("inputTokens") or 0)),
+                            "outputTokens": max(0, int(_turn_usage.get("outputTokens") or 0)),
+                            "cacheReadTokens": max(0, int(_turn_usage.get("cacheReadTokens") or 0)),
+                            "cacheWriteTokens": max(0, int(_turn_usage.get("cacheWriteTokens") or 0)),
+                            "reasoningTokens": max(0, int(_turn_usage.get("reasoningTokens") or 0)),
                         },
                         "hostDurationMs": max(
                             0,
