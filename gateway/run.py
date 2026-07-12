@@ -16959,6 +16959,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from gateway.zenos_runtime import (
                 compact_history as _zenos_compact_history,
                 gateway_preflight as _zenos_gateway_preflight,
+                handoff_messages as _zenos_handoff_messages,
                 infer_turn_context as _zenos_infer_turn_context,
                 middleware_settings as _zenos_middleware_settings,
                 new_turn_id as _zenos_new_turn_id,
@@ -16995,6 +16996,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     history=history,
                     workspace_root=_workspace_root,
                 )
+                _handoff_messages = []
+                if int(_routing_hints.get("estimatedContextTokens") or 0) >= int(
+                    _zenos_settings.get("context_soft_limit_tokens") or 160_000
+                ):
+                    _handoff_messages = _zenos_handoff_messages(
+                        history,
+                        max_chars=int(_zenos_settings.get("handoff_history_chars") or 240_000),
+                        max_messages=int(_zenos_settings.get("handoff_max_messages") or 300),
+                    )
                 _preflight_payload = {
                     "request": message,
                     "sessionId": _runtime_id,
@@ -17008,6 +17018,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         history,
                         int(_zenos_settings.get("max_history_chars") or 0),
                     ),
+                    "handoffMessages": _handoff_messages,
                     "workspaceRoot": _workspace_root or None,
                     **_routing_hints,
                 }
@@ -18879,7 +18890,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             _zenos_usage_before = None
             if _zenos_turn:
-                from gateway.zenos_runtime import agent_usage_snapshot as _zenos_agent_usage_snapshot
+                from gateway.zenos_runtime import (
+                    agent_usage_snapshot as _zenos_agent_usage_snapshot,
+                    apply_host_working_set_limit as _zenos_apply_host_working_set_limit,
+                )
+                _working_set = _zenos_apply_host_working_set_limit(
+                    agent,
+                    int((_zenos_settings or {}).get("context_soft_limit_tokens") or 160_000),
+                )
+                if _working_set.get("applied") and _working_set.get("applied") != _working_set.get("previous"):
+                    logger.info(
+                        "Zenos Host working set lowered: previous=%s applied=%s",
+                        _working_set.get("previous"),
+                        _working_set.get("applied"),
+                    )
                 _zenos_usage_before = _zenos_agent_usage_snapshot(agent)
 
             _approval_session_key = session_key or ""
@@ -19746,6 +19770,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "cacheReadTokens": max(0, int(_turn_usage.get("cacheReadTokens") or 0)),
                             "cacheWriteTokens": max(0, int(_turn_usage.get("cacheWriteTokens") or 0)),
                             "reasoningTokens": max(0, int(_turn_usage.get("reasoningTokens") or 0)),
+                            "calls": max(0, int(response.get("api_calls") or 0)),
                         },
                         "hostDurationMs": max(
                             0,

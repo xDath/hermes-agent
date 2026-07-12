@@ -195,6 +195,18 @@ def middleware_settings(config: Mapping[str, Any] | None) -> Dict[str, Any]:
             max(int(section.get("max_history_chars") or 16_000), 0),
             120_000,
         ),
+        "context_soft_limit_tokens": min(
+            max(int(section.get("context_soft_limit_tokens") or 160_000), 40_000),
+            500_000,
+        ),
+        "handoff_history_chars": min(
+            max(int(section.get("handoff_history_chars") or 240_000), 20_000),
+            500_000,
+        ),
+        "handoff_max_messages": min(
+            max(int(section.get("handoff_max_messages") or 300), 20),
+            400,
+        ),
         "disable_streaming_when_verified": bool(
             section.get("disable_streaming_when_verified", True)
         ),
@@ -237,6 +249,108 @@ def compact_history(history: Sequence[Mapping[str, Any]] | None, max_chars: int)
             break
     rendered = "\n".join(reversed(lines))
     return rendered[-max_chars:]
+
+
+def handoff_messages(
+    history: Sequence[Mapping[str, Any]] | None,
+    *,
+    max_chars: int = 240_000,
+    max_messages: int = 300,
+) -> List[Dict[str, str]]:
+    """Build a bounded, evidence-preserving transcript for durable compaction.
+
+    The active Hermes transcript remains canonical. This packet keeps a small
+    conversation head plus the recent tail, aggressively bounds raw tool
+    results, and is only sent to the local Runtime sidecar under context
+    pressure.
+    """
+    if not history or max_chars <= 0 or max_messages <= 0:
+        return []
+
+    rendered: List[Dict[str, str]] = []
+    for message in history:
+        if not isinstance(message, Mapping):
+            continue
+        role = str(message.get("role") or "").strip().lower()
+        if role not in {"user", "assistant", "tool", "system"}:
+            continue
+        text = _content_text(message.get("content")).strip()
+        if role == "assistant" and message.get("tool_calls"):
+            try:
+                calls = message.get("tool_calls")
+                names = []
+                if isinstance(calls, list):
+                    for call in calls[:12]:
+                        if not isinstance(call, Mapping):
+                            continue
+                        function = call.get("function")
+                        if isinstance(function, Mapping):
+                            name = str(function.get("name") or "").strip()
+                            if name:
+                                names.append(name)
+                if names:
+                    text = f"{text}\n[tool calls: {', '.join(names)}]".strip()
+            except Exception:
+                pass
+        if role == "tool":
+            name = str(message.get("name") or message.get("tool_name") or "tool").strip()
+            text = f"{name}: {text}" if text else f"{name}: completed"
+        if not text:
+            continue
+        per_message_limit = 2_500 if role == "tool" else 8_000
+        item: Dict[str, str] = {
+            "role": role,
+            "content": text[:per_message_limit],
+        }
+        name = str(message.get("name") or "").strip()
+        tool_call_id = str(message.get("tool_call_id") or "").strip()
+        if name:
+            item["name"] = name[:200]
+        if tool_call_id:
+            item["tool_call_id"] = tool_call_id[:500]
+        rendered.append(item)
+
+    if not rendered:
+        return []
+    head_count = min(3, len(rendered))
+    head = rendered[:head_count]
+    tail_candidates = rendered[head_count:]
+    head_chars = sum(len(item["content"]) for item in head)
+    remaining_chars = max(0, max_chars - head_chars)
+    remaining_messages = max(0, max_messages - len(head))
+    tail: List[Dict[str, str]] = []
+    used = 0
+    for item in reversed(tail_candidates):
+        size = len(item["content"])
+        if len(tail) >= remaining_messages or used + size > remaining_chars:
+            continue
+        tail.append(item)
+        used += size
+    tail.reverse()
+    return (head + tail)[-max_messages:]
+
+
+def apply_host_working_set_limit(agent: Any, soft_limit_tokens: int) -> Dict[str, int]:
+    """Lower the active compressor threshold to an absolute Host working set.
+
+    This does not delete stored history. It only causes Hermes' existing,
+    cache-aware context compression path to run before the prompt grows beyond
+    the configured working-set budget.
+    """
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is None:
+        return {"previous": 0, "applied": 0}
+    try:
+        context_length = max(1, int(getattr(compressor, "context_length", 0) or 0))
+        previous = max(1, int(getattr(compressor, "threshold_tokens", context_length) or context_length))
+        applied = max(40_000, min(int(soft_limit_tokens), context_length, previous))
+        if applied < previous:
+            compressor.threshold_tokens = applied
+            compressor.threshold_percent = applied / context_length
+        setattr(agent, "_zenos_host_working_set_tokens", applied)
+        return {"previous": previous, "applied": applied}
+    except Exception:
+        return {"previous": 0, "applied": 0}
 
 
 def infer_turn_context(
