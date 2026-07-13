@@ -1,8 +1,7 @@
 [Unit]
 Description=Hermes Agent Gateway - Zenos Profile
 After=network-online.target zenos-runtime.service zenos-memory.service
-Wants=network-online.target
-Requires=zenos-runtime.service zenos-memory.service
+Wants=network-online.target zenos-runtime.service zenos-memory.service
 StartLimitIntervalSec=0
 
 [Service]
