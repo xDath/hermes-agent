@@ -1,5 +1,7 @@
 """Unit tests for the native Hermes↔Zenos Runtime turn bridge helpers."""
 
+from pathlib import Path
+
 from gateway.zenos_runtime import (
     agent_usage_snapshot,
     apply_host_working_set_limit,
@@ -9,6 +11,7 @@ from gateway.zenos_runtime import (
     infer_turn_context,
     middleware_settings,
     new_turn_id,
+    resolve_workspace_root,
     runtime_session_id,
     usage_delta,
 )
@@ -56,9 +59,9 @@ def test_middleware_settings_are_fail_open_and_bounded():
     assert settings["fail_open"] is True
     assert settings["timeout_seconds"] == 600.0
     assert settings["max_history_chars"] == 120000
-    assert settings["context_soft_limit_tokens"] == 160000
-    assert settings["handoff_history_chars"] == 240000
-    assert settings["handoff_max_messages"] == 300
+    assert settings["context_soft_limit_tokens"] == 64000
+    assert settings["handoff_history_chars"] == 120000
+    assert settings["handoff_max_messages"] == 160
     assert settings["receipt"] == "full"
 
 
@@ -104,6 +107,8 @@ def test_host_working_set_limit_only_lowers_existing_compressor_threshold():
         context_length = 1_000_000
         threshold_tokens = 500_000
         threshold_percent = 0.5
+        summary_target_ratio = 0.25
+        tail_token_budget = 100_000
 
     class Agent:
         context_compressor = Compressor()
@@ -114,6 +119,30 @@ def test_host_working_set_limit_only_lowers_existing_compressor_threshold():
     assert applied == {"previous": 500_000, "applied": 160_000}
     assert agent.context_compressor.threshold_tokens == 160_000
     assert agent.context_compressor.threshold_percent == 0.16
+    assert agent.context_compressor.tail_token_budget == 40_000
+
+
+def test_workspace_resolution_prefers_explicit_repo_then_reuses_session_repo(tmp_path):
+    root = Path(tmp_path)
+    runtime = root / "zenos-runtime"
+    memory = root / "zenos-memory"
+    for repo in (runtime, memory):
+        repo.mkdir()
+        (repo / "package.json").write_text("{}", encoding="utf-8")
+
+    selected = resolve_workspace_root(
+        "audit zenos memory secara detail",
+        candidates=[str(root)],
+        previous=str(runtime),
+    )
+    assert selected == str(memory.resolve())
+
+    reused = resolve_workspace_root(
+        "lanjut benerin yang tadi",
+        candidates=[str(root)],
+        previous=selected,
+    )
+    assert reused == selected
 
 
 def test_infer_turn_context_marks_code_mutation_and_live_verification_hints():

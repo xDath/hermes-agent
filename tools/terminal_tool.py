@@ -2703,35 +2703,30 @@ def terminal_tool(
             except Exception:
                 pass
             
-            # Truncate output if too long, keeping both head and tail
+            # Normalize and redact the COMPLETE output before any persistence.
+            # This lets oversized results be preserved as safe artifacts instead
+            # of silently discarding the middle of logs/build output.
+            from tools.ansi_strip import strip_ansi
+            from agent.redact import redact_terminal_output
+            output = strip_ansi(output)
+            output = redact_terminal_output(output.strip(), command) if output else ""
+
             from tools.tool_output_limits import get_max_bytes
             MAX_OUTPUT_CHARS = get_max_bytes()
             if len(output) > MAX_OUTPUT_CHARS:
-                head_chars = int(MAX_OUTPUT_CHARS * 0.4)  # 40% head (error messages often appear early)
-                tail_chars = MAX_OUTPUT_CHARS - head_chars  # 60% tail (most recent/relevant output)
-                omitted = len(output) - head_chars - tail_chars
-                truncated_notice = (
-                    f"\n\n... [OUTPUT TRUNCATED - {omitted} chars omitted "
-                    f"out of {len(output)} total] ...\n\n"
+                from tools.hook_output_spill import spill_if_oversized
+                output = spill_if_oversized(
+                    output,
+                    session_id=session_id or task_id or effective_task_id or "default",
+                    source="OUTPUT TRUNCATED - terminal",
+                    config={
+                        "enabled": True,
+                        "max_chars": MAX_OUTPUT_CHARS,
+                        "preview_head": int(MAX_OUTPUT_CHARS * 0.35),
+                        "preview_tail": int(MAX_OUTPUT_CHARS * 0.55),
+                        "directory": None,
+                    },
                 )
-                output = output[:head_chars] + truncated_notice + output[-tail_chars:]
-
-            # Strip ANSI escape sequences so the model never sees terminal
-            # formatting — prevents it from copying escapes into file writes.
-            from tools.ansi_strip import strip_ansi
-            output = strip_ansi(output)
-
-            # Redact secrets from command output. For source/config dumps
-            # (MAX_TOKENS=100, "apiKey": "x" fixtures, postgresql:// f-string
-            # templates) the ENV/JSON/template passes are skipped to avoid
-            # false positives (code_file=True). But for env-dump commands
-            # (env/printenv/set/export/declare) the output IS a KEY=value
-            # credential dump, so redact_terminal_output runs the ENV pass
-            # (code_file=False) to mask opaque tokens with no vendor prefix.
-            # Real prefixes, auth headers, JWTs, private keys are masked in
-            # both modes. See issue #43025.
-            from agent.redact import redact_terminal_output
-            output = redact_terminal_output(output.strip(), command) if output else ""
 
             # Interpret non-zero exit codes that aren't real errors
             # (e.g. grep=1 means "no matches", diff=1 means "files differ")

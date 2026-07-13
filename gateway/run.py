@@ -16963,6 +16963,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 infer_turn_context as _zenos_infer_turn_context,
                 middleware_settings as _zenos_middleware_settings,
                 new_turn_id as _zenos_new_turn_id,
+                resolve_workspace_root as _zenos_resolve_workspace_root,
                 runtime_session_id as _zenos_runtime_session_id,
             )
 
@@ -16977,18 +16978,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _zenos_host_provider = str(
                     (_zenos_host_runtime or {}).get("provider") or "default"
                 )
-                _workspace_root = ""
-                _workspace_candidate = os.getenv("TERMINAL_CWD", "").strip()
-                if _workspace_candidate:
-                    try:
-                        _workspace_path = Path(_workspace_candidate).expanduser().resolve()
-                        if _workspace_path.is_dir() and any(
-                            (_workspace_path / marker).exists()
-                            for marker in (".git", "package.json", "pyproject.toml", "Cargo.toml", "go.mod")
-                        ):
-                            _workspace_root = str(_workspace_path)
-                    except Exception:
-                        _workspace_root = ""
+                _workspace_cache = getattr(self, "_zenos_workspace_roots", None)
+                if not isinstance(_workspace_cache, dict):
+                    _workspace_cache = {}
+                    setattr(self, "_zenos_workspace_roots", _workspace_cache)
+                _terminal_cfg = user_config.get("terminal") if isinstance(user_config, dict) else {}
+                _configured_cwd = str((_terminal_cfg or {}).get("cwd") or "").strip() if isinstance(_terminal_cfg, dict) else ""
+                _workspace_root = _zenos_resolve_workspace_root(
+                    message,
+                    candidates=[os.getenv("TERMINAL_CWD", "").strip(), _configured_cwd],
+                    previous=str(_workspace_cache.get(session_key or session_id) or ""),
+                )
+                if _workspace_root:
+                    _workspace_cache[session_key or session_id] = _workspace_root
                 _runtime_id = _zenos_runtime_session_id(session_key or session_id)
                 _turn_id = _zenos_new_turn_id(session_id)
                 _routing_hints = _zenos_infer_turn_context(
@@ -18959,11 +18961,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
                 if _zenos_turn and _zenos_usage_before is not None:
-                    from gateway.zenos_runtime import usage_delta as _zenos_usage_delta
+                    from gateway.zenos_runtime import (
+                        usage_delta as _zenos_usage_delta,
+                        workspace_root_from_text as _zenos_workspace_root_from_text,
+                    )
                     result["zenos_turn_usage"] = _zenos_usage_delta(
                         _zenos_usage_before,
                         _zenos_agent_usage_snapshot(agent),
                     )
+                    try:
+                        _observed_workspace = _zenos_workspace_root_from_text(
+                            str(result.get("tools") or ""),
+                        )
+                        if _observed_workspace:
+                            _workspace_cache = getattr(self, "_zenos_workspace_roots", None)
+                            if not isinstance(_workspace_cache, dict):
+                                _workspace_cache = {}
+                                setattr(self, "_zenos_workspace_roots", _workspace_cache)
+                            _workspace_cache[session_key or session_id] = _observed_workspace
+                    except Exception:
+                        pass
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent

@@ -68,26 +68,31 @@ class ToolSearchConfig:
     threshold_pct: float  # 0..100 — only used when enabled == "auto"
     search_default_limit: int
     max_search_limit: int
+    defer_core_tools: bool
+    always_visible: frozenset[str]
 
     @classmethod
     def from_raw(cls, raw: Any) -> "ToolSearchConfig":
         """Build a config from a raw dict / bool / None.
 
-        Accepts the legacy bool shape (``tools.tool_search: true``) and the
-        dict shape (``tools.tool_search: {enabled: auto, ...}``). Validates
-        and clamps every numeric field; unknown values fall back to safe
-        defaults rather than raising, so a typo in user config does not
-        break the agent.
+        ``defer_core_tools`` is opt-in because smaller models may depend on the
+        historical all-core-visible surface. Personal Zenos enables it with an
+        explicit ``always_visible`` narrow waist so Host keeps its everyday
+        tools while rare/admin tools move behind progressive disclosure.
         """
+        defaults = {
+            "threshold_pct": 10.0,
+            "search_default_limit": 5,
+            "max_search_limit": 20,
+            "defer_core_tools": False,
+            "always_visible": frozenset(),
+        }
         if raw is True:
-            return cls(enabled="auto", threshold_pct=10.0,
-                       search_default_limit=5, max_search_limit=20)
+            return cls(enabled="auto", **defaults)
         if raw is False:
-            return cls(enabled="off", threshold_pct=10.0,
-                       search_default_limit=5, max_search_limit=20)
+            return cls(enabled="off", **defaults)
         if not isinstance(raw, dict):
-            return cls(enabled="auto", threshold_pct=10.0,
-                       search_default_limit=5, max_search_limit=20)
+            return cls(enabled="auto", **defaults)
 
         enabled_raw = str(raw.get("enabled", "auto")).strip().lower()
         if enabled_raw in ("true", "1", "yes"):
@@ -99,18 +104,26 @@ class ToolSearchConfig:
         else:
             enabled = "auto"
 
-        threshold_pct = _safe_float(raw.get("threshold_pct"), 10.0)
-        threshold_pct = max(0.0, min(100.0, threshold_pct))
-
+        threshold_pct = max(0.0, min(100.0, _safe_float(raw.get("threshold_pct"), 10.0)))
         max_search_limit = max(1, min(50, _safe_int(raw.get("max_search_limit"), 20)))
-        search_default_limit = max(1, min(max_search_limit,
-                                          _safe_int(raw.get("search_default_limit"), 5)))
+        search_default_limit = max(
+            1,
+            min(max_search_limit, _safe_int(raw.get("search_default_limit"), 5)),
+        )
+        raw_visible = raw.get("always_visible", [])
+        always_visible = frozenset(
+            str(item).strip()
+            for item in raw_visible
+            if isinstance(item, str) and str(item).strip()
+        ) if isinstance(raw_visible, (list, tuple, set)) else frozenset()
 
         return cls(
             enabled=enabled,
             threshold_pct=threshold_pct,
             search_default_limit=search_default_limit,
             max_search_limit=max_search_limit,
+            defer_core_tools=bool(raw.get("defer_core_tools", False)),
+            always_visible=always_visible,
         )
 
 
@@ -148,10 +161,10 @@ def load_config() -> ToolSearchConfig:
 
 
 def _core_tool_names() -> frozenset[str]:
-    """Return the set of tool names that must NEVER be deferred.
+    """Return the historical Hermes core tool set.
 
-    Imported lazily because ``toolsets`` imports from ``tools.registry``
-    and we don't want a hard cycle.
+    Core tools remain visible by default. A profile may explicitly defer the
+    non-essential subset while keeping an allowlisted narrow waist visible.
     """
     try:
         from toolsets import _HERMES_CORE_TOOLS
@@ -160,18 +173,18 @@ def _core_tool_names() -> frozenset[str]:
         return frozenset()
 
 
-def is_deferrable_tool_name(name: str) -> bool:
-    """Return True if a tool with this name is *eligible* for deferral.
-
-    A tool is deferrable iff it is registered with an MCP toolset prefix
-    OR it is not in ``_HERMES_CORE_TOOLS``. Core tools are never deferred
-    even when their toolset is technically plugin-provided (this protects
-    against accidental shadowing).
-    """
+def is_deferrable_tool_name(
+    name: str,
+    config: Optional[ToolSearchConfig] = None,
+) -> bool:
+    """Return True if a tool is eligible for progressive disclosure."""
     if name in BRIDGE_TOOL_NAMES:
         return False
-    if name in _core_tool_names():
+    resolved = config or load_config()
+    if name in resolved.always_visible:
         return False
+    if name in _core_tool_names():
+        return resolved.defer_core_tools
     # Check registry toolset for MCP prefix.
     try:
         from tools.registry import registry
@@ -195,6 +208,7 @@ def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
     """
     visible: List[Dict[str, Any]] = []
     deferrable: List[Dict[str, Any]] = []
+    config = load_config()
     for td in tool_defs:
         fn = td.get("function") or {}
         name = fn.get("name", "")
@@ -202,7 +216,7 @@ def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
             # Should never happen — bridge tools are added after classification —
             # but be defensive.
             continue
-        if is_deferrable_tool_name(name):
+        if is_deferrable_tool_name(name, config):
             deferrable.append(td)
         else:
             visible.append(td)

@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -196,15 +197,15 @@ def middleware_settings(config: Mapping[str, Any] | None) -> Dict[str, Any]:
             120_000,
         ),
         "context_soft_limit_tokens": min(
-            max(int(section.get("context_soft_limit_tokens") or 160_000), 40_000),
+            max(int(section.get("context_soft_limit_tokens") or 64_000), 24_000),
             500_000,
         ),
         "handoff_history_chars": min(
-            max(int(section.get("handoff_history_chars") or 240_000), 20_000),
+            max(int(section.get("handoff_history_chars") or 120_000), 20_000),
             500_000,
         ),
         "handoff_max_messages": min(
-            max(int(section.get("handoff_max_messages") or 300), 20),
+            max(int(section.get("handoff_max_messages") or 160), 20),
             400,
         ),
         "disable_streaming_when_verified": bool(
@@ -343,10 +344,19 @@ def apply_host_working_set_limit(agent: Any, soft_limit_tokens: int) -> Dict[str
     try:
         context_length = max(1, int(getattr(compressor, "context_length", 0) or 0))
         previous = max(1, int(getattr(compressor, "threshold_tokens", context_length) or context_length))
-        applied = max(40_000, min(int(soft_limit_tokens), context_length, previous))
+        applied = max(24_000, min(int(soft_limit_tokens), context_length, previous))
         if applied < previous:
             compressor.threshold_tokens = applied
             compressor.threshold_percent = applied / context_length
+
+            # ContextCompressor derives its post-compression tail budget only at
+            # construction time. Lowering threshold_tokens without updating the
+            # dependent budget causes compression thrashing: a 64K trigger can
+            # still target the old 40K tail. Keep the target proportional so a
+            # pressure event creates real headroom for several future turns.
+            ratio = float(getattr(compressor, "summary_target_ratio", 0.25) or 0.25)
+            ratio = max(0.10, min(ratio, 0.40))
+            compressor.tail_token_budget = max(4_000, min(int(applied * ratio), applied - 1))
         setattr(agent, "_zenos_host_working_set_tokens", applied)
         return {"previous": previous, "applied": applied}
     except Exception:
@@ -371,12 +381,16 @@ def infer_turn_context(
     code_terms = (
         "code", "coding", "repo", "repository", "file", "function", "class",
         "bug", "error", "stack trace", "typescript", "javascript", "python",
-        "commit", "branch", "test", "lint", "build", "api", "endpoint",
-        "kode", "ngoding", "perbaiki", "implement", "refactor",
+        "commit", "branch", "test", "lint", "build", "compile", "api", "endpoint",
+        "route", "handler", "controller", "service", "schema", "database", "migration",
+        "migrasi", "table", "kolom", "column", "query", "sql", "source", "golang",
+        "go code", "rust", "java", "frontend", "backend", "component", "hook",
+        "kode", "coding", "ngoding", "perbaiki", "benerin", "implement", "refactor",
     )
     mutation_terms = (
-        "fix", "ubah", "edit", "buat", "bikin", "implement", "refactor",
-        "hapus", "delete", "deploy", "restart", "push", "commit", "install",
+        "fix", "ubah", "edit", "buat", "bikin", "tambah", "tambahkan", "implement", "refactor",
+        "benerin", "betulin", "ganti", "replace", "migrasi", "migration", "hapus", "delete",
+        "deploy", "restart", "push", "commit", "install",
     )
     log_terms = ("log", "journalctl", "traceback", "stack trace", "stdout", "stderr")
     verification_terms = (
@@ -419,6 +433,79 @@ def infer_turn_context(
         "containsUntrustedInput": False,
         "requiresFreshData": any(term in lower for term in fresh_terms),
     }
+
+
+def _is_repository_root(path: Path) -> bool:
+    return path.is_dir() and any(
+        (path / marker).exists()
+        for marker in (".git", "package.json", "pyproject.toml", "Cargo.toml", "go.mod")
+    )
+
+
+def resolve_workspace_root(
+    message: str,
+    *,
+    candidates: Sequence[str] | None = None,
+    previous: str = "",
+) -> str:
+    """Resolve a session workspace without treating a multi-repo parent as a repo.
+
+    An explicit repository name/path in the current message wins. Otherwise a
+    previously observed repository remains active for follow-up instructions.
+    """
+    text = str(message or "").lower()
+    roots: List[Path] = []
+    for raw in candidates or []:
+        try:
+            path = Path(str(raw)).expanduser().resolve()
+        except Exception:
+            continue
+        if path.is_dir() and path not in roots:
+            roots.append(path)
+
+    repositories: List[Path] = []
+    for root in roots:
+        if _is_repository_root(root):
+            repositories.append(root)
+            continue
+        try:
+            for child in list(root.iterdir())[:200]:
+                if _is_repository_root(child):
+                    repositories.append(child.resolve())
+        except OSError:
+            continue
+
+    for repository in repositories:
+        name = repository.name.lower()
+        aliases = {name, name.replace("-", " "), name.replace("_", " ")}
+        if str(repository).lower() in text or any(alias and alias in text for alias in aliases):
+            return str(repository)
+
+    if previous:
+        try:
+            previous_path = Path(previous).expanduser().resolve()
+            if _is_repository_root(previous_path):
+                return str(previous_path)
+        except Exception:
+            pass
+
+    return str(repositories[0]) if len(repositories) == 1 else ""
+
+
+def workspace_root_from_text(text: str, *, allowed_parent: str = "/root/openclaw-projects") -> str:
+    """Extract a repository path from bounded tool evidence."""
+    raw = str(text or "")
+    parent = Path(allowed_parent).expanduser().resolve()
+    pattern = re.compile(r"(?:/root/openclaw-projects|/workspace)/[A-Za-z0-9._-]+")
+    for match in pattern.finditer(raw):
+        try:
+            candidate = Path(match.group(0)).expanduser().resolve()
+            candidate.relative_to(parent)
+        except Exception:
+            continue
+        if _is_repository_root(candidate):
+            return str(candidate)
+    return ""
 
 
 def new_turn_id(session_id: str) -> str:

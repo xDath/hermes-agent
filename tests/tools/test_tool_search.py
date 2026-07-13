@@ -82,15 +82,27 @@ class TestConfigParsing:
         assert cfg.max_search_limit == 50
         assert cfg.search_default_limit <= cfg.max_search_limit
 
+    def test_personal_profile_can_defer_nonessential_core_tools(self):
+        from tools.tool_search import ToolSearchConfig, is_deferrable_tool_name
+        cfg = ToolSearchConfig.from_raw({
+            "enabled": "on",
+            "defer_core_tools": True,
+            "always_visible": ["terminal", "read_file", "patch"],
+        })
+        assert not is_deferrable_tool_name("terminal", cfg)
+        assert not is_deferrable_tool_name("read_file", cfg)
+        assert is_deferrable_tool_name("session_search", cfg)
+        assert is_deferrable_tool_name("delegate_task", cfg)
+
 
 # ---------------------------------------------------------------------------
-# Classification — the hard invariant: core tools NEVER defer.
+# Classification — core tools stay visible by default; opt-in profiles may narrow them.
 # ---------------------------------------------------------------------------
 
 
 class TestClassification:
     def test_core_tools_never_defer(self):
-        """The critical invariant from the OpenClaw report."""
+        """Default configuration preserves the historical core visibility invariant."""
         from tools.tool_search import is_deferrable_tool_name
         # Sample of core tools from _HERMES_CORE_TOOLS.
         for core_name in ["terminal", "read_file", "write_file", "patch",
@@ -98,7 +110,7 @@ class TestClassification:
                           "web_search", "session_search", "clarify",
                           "execute_code", "delegate_task", "send_message"]:
             assert not is_deferrable_tool_name(core_name), (
-                f"Core tool '{core_name}' must NEVER be deferrable"
+                f"Core tool '{core_name}' must stay visible by default"
             )
 
     def test_bridge_tools_never_defer(self):
