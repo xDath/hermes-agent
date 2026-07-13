@@ -18891,8 +18891,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
             _zenos_usage_before = None
+            _zenos_host_budget_state = None
             if _zenos_turn:
                 from gateway.zenos_runtime import (
+                    apply_host_token_budget as _zenos_apply_host_token_budget,
                     agent_usage_snapshot as _zenos_agent_usage_snapshot,
                     apply_host_working_set_limit as _zenos_apply_host_working_set_limit,
                 )
@@ -18907,6 +18909,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _working_set.get("applied"),
                     )
                 _zenos_usage_before = _zenos_agent_usage_snapshot(agent)
+                _zenos_host_budget_state = _zenos_apply_host_token_budget(
+                    agent,
+                    (_zenos_turn or {}).get("hostBudget"),
+                )
+                if _zenos_host_budget_state.get("applied"):
+                    logger.info(
+                        "Zenos Host budget applied: budget=%s calls=%s output=%s",
+                        _zenos_host_budget_state.get("budgetId"),
+                        _zenos_host_budget_state.get("maxIterations"),
+                        _zenos_host_budget_state.get("maxTokens"),
+                    )
 
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
@@ -18982,6 +18995,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         pass
             finally:
+                if _zenos_host_budget_state:
+                    try:
+                        from gateway.zenos_runtime import restore_host_token_budget as _zenos_restore_host_token_budget
+                        _zenos_restore_host_token_budget(agent, _zenos_host_budget_state)
+                    except Exception:
+                        logger.exception("Failed to restore Hermes Host token budget state")
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
                 # threads don't hang past the end of the run (interrupt,

@@ -16,7 +16,8 @@ Environment=LOGNAME=root
 Environment=PATH=/usr/local/lib/hermes-agent/venv/bin:/usr/local/lib/hermes-agent/node_modules/.bin:/usr/bin:/root/.local/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/bin
 Environment=VIRTUAL_ENV=/usr/local/lib/hermes-agent/venv
 Environment=HERMES_HOME=/root/.hermes
-ExecStart=/usr/local/lib/hermes-agent/venv/bin/python -m hermes_cli.main -p zenos gateway run --replace
+LoadCredentialEncrypted=zenos-runtime.env:/etc/credstore.encrypted/zenos-runtime.env.cred
+ExecStart=/bin/sh -c 'set -a; . "$CREDENTIALS_DIRECTORY/zenos-runtime.env"; set +a; exec /usr/local/lib/hermes-agent/venv/bin/python -m hermes_cli.main -p zenos gateway run --replace'
 Restart=always
 RestartSec=5
 RestartForceExitStatus=75
@@ -25,6 +26,20 @@ KillSignal=SIGTERM
 ExecReload=/bin/kill -USR1 $MAINPID
 ExecStopPost=-/usr/local/lib/hermes-agent/venv/bin/python -m gateway.cgroup_cleanup
 TimeoutStopSec=210
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+LimitNOFILE=65536
 StandardOutput=journal
 StandardError=journal
 

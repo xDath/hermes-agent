@@ -99,10 +99,10 @@ def _runtime_key() -> str:
     key = os.getenv("ZENOS_RUNTIME_API_KEY", "").strip()
     if key:
         return key
+    credential_directory = os.getenv("CREDENTIALS_DIRECTORY", "").strip()
     candidates = [
         os.getenv("ZENOS_RUNTIME_ENV_FILE", ""),
-        "/root/openclaw-projects/zenos-runtime/.env.local",
-        "/root/openclaw-projects/zenos-runtime/.env",
+        str(Path(credential_directory) / "zenos-runtime.env") if credential_directory else "",
     ]
     for candidate in candidates:
         if not candidate:
@@ -119,6 +119,40 @@ def _runtime_key() -> str:
         except OSError:
             continue
     raise RuntimeError("ZENOS_RUNTIME_API_KEY is not configured")
+
+
+def apply_host_token_budget(agent: Any, budget: Mapping[str, Any] | None) -> Dict[str, Any]:
+    """Apply one Runtime-issued Host cap without mutating the cached prompt.
+
+    The returned state must be passed to :func:`restore_host_token_budget` at
+    the end of the turn so a cached agent never inherits another turn's cap.
+    """
+    if not isinstance(budget, Mapping):
+        return {"applied": False}
+    max_calls = max(1, min(int(budget.get("maxCalls") or 1), 32))
+    max_output = max(128, min(int(budget.get("maxOutputTokens") or 2048), 32_000))
+    previous_iterations = max(1, int(getattr(agent, "max_iterations", max_calls) or max_calls))
+    previous_tokens = getattr(agent, "max_tokens", None)
+    applied_iterations = min(previous_iterations, max_calls)
+    applied_tokens = min(int(previous_tokens), max_output) if previous_tokens else max_output
+    agent.max_iterations = applied_iterations
+    agent.max_tokens = applied_tokens
+    return {
+        "applied": True,
+        "budgetId": str(budget.get("budgetId") or ""),
+        "reservationId": str(budget.get("reservationId") or ""),
+        "previousMaxIterations": previous_iterations,
+        "previousMaxTokens": previous_tokens,
+        "maxIterations": applied_iterations,
+        "maxTokens": applied_tokens,
+    }
+
+
+def restore_host_token_budget(agent: Any, state: Mapping[str, Any] | None) -> None:
+    if not isinstance(state, Mapping) or not state.get("applied"):
+        return
+    agent.max_iterations = int(state.get("previousMaxIterations") or agent.max_iterations)
+    agent.max_tokens = state.get("previousMaxTokens")
 
 
 def get_runtime_models(session_id: str) -> Dict[str, Any]:
