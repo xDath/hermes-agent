@@ -1,0 +1,32 @@
+[Unit]
+Description=Hermes Agent Gateway - Zenos Profile
+After=network-online.target zenos-runtime.service zenos-memory.service
+Wants=network-online.target
+Requires=zenos-runtime.service zenos-memory.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/usr/local/lib/hermes-agent
+Environment=HOME=/root
+Environment=USER=root
+Environment=LOGNAME=root
+Environment=PATH=/usr/local/lib/hermes-agent/venv/bin:/usr/local/lib/hermes-agent/node_modules/.bin:/usr/bin:/root/.local/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/bin
+Environment=VIRTUAL_ENV=/usr/local/lib/hermes-agent/venv
+Environment=HERMES_HOME=/root/.hermes
+ExecStart=/usr/local/lib/hermes-agent/venv/bin/python -m hermes_cli.main -p zenos gateway run --replace
+Restart=always
+RestartSec=5
+RestartForceExitStatus=75
+KillMode=mixed
+KillSignal=SIGTERM
+ExecReload=/bin/kill -USR1 $MAINPID
+ExecStopPost=-/usr/local/lib/hermes-agent/venv/bin/python -m gateway.cgroup_cleanup
+TimeoutStopSec=210
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
