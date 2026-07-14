@@ -19822,6 +19822,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _verified_answer = str(
                         (_postflight or {}).get("finalAnswer") or _candidate_answer
                     )
+                    if bool((_postflight or {}).get("failed")):
+                        response["failed"] = True
                     _answer_changed = _verified_answer != _candidate_answer
                     if _answer_changed:
                         response["final_response"] = _verified_answer
@@ -19900,6 +19902,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     result_holder[0]["response_transformed"] = response.get(
                         "response_transformed", False
                     )
+                    result_holder[0]["failed"] = bool(response.get("failed"))
                     if response.get("zenos_runtime") is not None:
                         result_holder[0]["zenos_runtime"] = response.get("zenos_runtime")
 
