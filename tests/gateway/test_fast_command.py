@@ -267,7 +267,8 @@ async def test_run_agent_executes_native_zenos_preflight_and_postflight(monkeypa
     def fake_postflight(payload, **_kwargs):
         postflight_payloads.append(payload)
         return {
-            "ok": True,
+            "ok": False,
+            "failed": True,
             "finalAnswer": "verified Runtime answer",
             "transformed": True,
             "receipt": {
@@ -328,6 +329,7 @@ async def test_run_agent_executes_native_zenos_preflight_and_postflight(monkeypa
     assert _CapturingAgent.last_run["persist_user_message"] == "fix bug ini dan test sampai bener"
     assert postflight_payloads[0]["draft"] == "unverified Host draft"
     assert result["final_response"].startswith("verified Runtime answer")
+    assert result["failed"] is True
     assert "Worker build" in result["final_response"]
     assert "Verifier grok/pass" in result["final_response"]
     runner.session_store.rewrite_transcript.assert_called_once()
