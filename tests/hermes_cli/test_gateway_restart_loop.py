@@ -217,7 +217,7 @@ class TestCronCreateLifecycleBlock:
 # ---------------------------------------------------------------------------
 
 class TestGatewaySelfTargetingGuard:
-    """Verify hermes gateway stop/restart refuse when _HERMES_GATEWAY=1."""
+    """Stop stays blocked while restart uses the graceful self-handoff."""
 
     def test_stop_refuses_inside_gateway(self, monkeypatch):
         monkeypatch.setenv("_HERMES_GATEWAY", "1")
@@ -227,13 +227,16 @@ class TestGatewaySelfTargetingGuard:
             gateway_command(args)
         assert exc_info.value.code == 1
 
-    def test_restart_refuses_inside_gateway(self, monkeypatch):
+    def test_restart_schedules_inside_gateway(self, monkeypatch, capsys):
         monkeypatch.setenv("_HERMES_GATEWAY", "1")
-        from hermes_cli.gateway import gateway_command
+        import hermes_cli.gateway as gw
+        import gateway.status as gateway_status
+
+        monkeypatch.setattr(gateway_status, "get_running_pid", lambda: 4242)
+        monkeypatch.setattr(gw, "_request_gateway_self_restart", lambda pid: pid == 4242)
         args = Namespace(gateway_command="restart", all=False, system=False)
-        with pytest.raises(SystemExit) as exc_info:
-            gateway_command(args)
-        assert exc_info.value.code == 1
+        gw.gateway_command(args)
+        assert "restart scheduled" in capsys.readouterr().out.lower()
 
     def test_stop_allows_outside_gateway(self, monkeypatch):
         # With the gateway marker unset, the self-targeting guard must NOT
@@ -280,12 +283,12 @@ class TestGatewaySelfTargetingGuard:
 # ---------------------------------------------------------------------------
 
 class TestTerminalToolGatewayLifecycleGuard:
-    """terminal_tool must refuse gateway lifecycle commands when _HERMES_GATEWAY=1.
+    """Standalone restart is handed off safely; destructive lifecycle stays blocked.
 
-    Issue #37453: systemctl --user restart hermes-gateway runs as a child of the
-    gateway process.  When systemd delivers SIGTERM the gateway kills its own
-    restart command mid-execution — the service may never restart.  The guard
-    must fire before execution, unconditionally (force=True cannot bypass it).
+    Issue #37453: systemctl restart as a child of the gateway dies together with
+    its parent. The terminal tool now converts one standalone restart into the
+    gateway's SIGUSR1 graceful self-handoff, while stop/kill/compound commands
+    remain blocked and cannot be bypassed with force=True.
     """
 
     def _make_fake_env(self):
@@ -312,13 +315,29 @@ class TestTerminalToolGatewayLifecycleGuard:
 
     @pytest.mark.parametrize("cmd", [
         "systemctl restart hermes-gateway",
-        "systemctl --user restart hermes-gateway",
-        "systemctl stop hermes-gateway.service",
+        "systemctl --user restart hermes-gateway.service",
         "hermes gateway restart",
+        "hermes -p zenos gateway restart",
+    ])
+    def test_schedules_standalone_restart_inside_gateway(self, monkeypatch, cmd):
+        import tools.terminal_tool as tt
+        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+        scheduled = []
+        monkeypatch.setattr(tt, "_schedule_gateway_self_restart", lambda: scheduled.append(cmd) or True)
+
+        result = json.loads(tt.terminal_tool(command=cmd))
+
+        assert result["exit_code"] == 0
+        assert result["restart_scheduled"] is True
+        assert scheduled == [cmd]
+
+    @pytest.mark.parametrize("cmd", [
+        "systemctl stop hermes-gateway.service",
         "launchctl kickstart gui/501/ai.hermes.gateway",
         "pkill -f hermes.*gateway",
+        "systemctl restart hermes-gateway && systemctl status hermes-gateway",
     ])
-    def test_blocks_lifecycle_commands_inside_gateway(self, monkeypatch, cmd):
+    def test_blocks_unsafe_lifecycle_commands_inside_gateway(self, monkeypatch, cmd):
         import tools.terminal_tool as tt
         self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
 
@@ -327,12 +346,12 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 1
         assert "Blocked" in result["error"]
 
-    def test_force_true_cannot_bypass_block(self, monkeypatch):
+    def test_force_true_cannot_bypass_destructive_block(self, monkeypatch):
         import tools.terminal_tool as tt
         self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
 
         result = json.loads(tt.terminal_tool(
-            command="systemctl restart hermes-gateway", force=True
+            command="systemctl stop hermes-gateway", force=True
         ))
 
         assert result["exit_code"] == 1

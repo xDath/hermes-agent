@@ -2007,6 +2007,23 @@ def _resolve_command_cwd(
     return default_cwd
 
 
+def _schedule_gateway_self_restart() -> bool:
+    """Request a graceful gateway restart without killing the active tool call.
+
+    The gateway's SIGUSR1 handler marks a supervised restart as pending, drains
+    the current run, then exits with the planned-restart code so systemd or
+    launchd relaunches it.  This is safe from inside the gateway; invoking
+    systemctl restart directly is not, because SIGTERM kills the child command
+    together with its parent before the restart transaction can complete.
+    """
+    try:
+        from hermes_cli.gateway import _request_gateway_self_restart
+        return bool(_request_gateway_self_restart(os.getpid()))
+    except Exception:
+        logger.exception("Failed to schedule gateway self-restart")
+        return False
+
+
 def terminal_tool(
     command: str,
     background: bool = False,
@@ -2247,25 +2264,42 @@ def terminal_tool(
                         env = new_env
                     logger.info("%s environment ready for task %s", env_type, effective_task_id[:8])
 
-        # Hard-block: gateway lifecycle commands (systemctl/launchctl/hermes
-        # restart|stop targeting hermes-gateway) must never run inside the
-        # gateway process itself. The restart would SIGTERM the gateway, which
-        # kills this very subprocess before it can complete — the service may
-        # never restart. This mirrors the `hermes gateway restart` guard in
-        # hermes_cli/gateway.py and the cron-path guard in hermes_cli/cron.py,
-        # but applies unconditionally (force=True cannot help here).
+        # Gateway lifecycle handling inside the gateway process. A standalone
+        # restart is converted into the gateway's SIGUSR1 graceful handoff:
+        # the current run finishes, then the supervisor relaunches the service.
+        # Stop/kill commands and compound restart commands remain blocked to
+        # prevent agent-driven SIGTERM/respawn loops.
         if os.environ.get("_HERMES_GATEWAY") == "1":
             from hermes_cli.cron import _contains_gateway_lifecycle_command
+            from cron.lifecycle_guard import is_gateway_restart_command
+
+            if is_gateway_restart_command(command):
+                if _schedule_gateway_self_restart():
+                    return json.dumps({
+                        "output": (
+                            "Gateway restart scheduled. The current turn will finish, "
+                            "then the supervised gateway will restart automatically."
+                        ),
+                        "exit_code": 0,
+                        "error": "",
+                        "status": "success",
+                        "restart_scheduled": True,
+                    }, ensure_ascii=False)
+                return json.dumps({
+                    "output": "",
+                    "exit_code": 1,
+                    "error": "Could not schedule the gateway's graceful self-restart.",
+                    "status": "error",
+                }, ensure_ascii=False)
+
             if _contains_gateway_lifecycle_command(command):
                 return json.dumps({
                     "output": "",
                     "exit_code": 1,
                     "error": (
-                        "Blocked: cannot restart or stop the gateway from inside the "
-                        "gateway process. The gateway would kill this command before "
-                        "it could complete (SIGTERM propagates to child processes). "
-                        "Run `hermes gateway restart` from a separate shell outside "
-                        "the running gateway."
+                        "Blocked: only a standalone gateway restart can be safely "
+                        "handed off from inside the gateway. Stop, kill, start, and "
+                        "compound lifecycle commands must run from an external shell."
                     ),
                     "status": "error",
                 }, ensure_ascii=False)
