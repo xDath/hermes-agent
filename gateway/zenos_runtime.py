@@ -406,10 +406,13 @@ def infer_turn_context(
     """Derive conservative deterministic routing hints from one Hermes turn."""
     text = str(message or "")
     lower = text.lower()
+    history_items = [item for item in (history or []) if isinstance(item, Mapping)]
     history_chars = sum(
         len(_content_text(item.get("content")))
-        for item in (history or [])
-        if isinstance(item, Mapping)
+        + len(json.dumps(item.get("tool_calls") or "", ensure_ascii=False, default=str))
+        + len(json.dumps(item.get("reasoning") or "", ensure_ascii=False, default=str))
+        + len(str(item.get("tool_name") or ""))
+        for item in history_items
     )
     estimated_tokens = max(1, (len(text) + history_chars) // 4)
     code_terms = (
@@ -446,8 +449,36 @@ def infer_turn_context(
     )
     has_code = any(term in lower for term in code_terms)
     has_mutation = any(term in lower for term in mutation_terms)
+    # Short acknowledgements such as "Gas" are common continuation commands.
+    # Preserve the active coding intent only when recent history contains both
+    # code evidence and an explicitly unfinished mutation, so casual chat does
+    # not get promoted to an expensive coding pipeline.
+    recent_history = "\n".join(
+        _content_text(item.get("content"))
+        for item in history_items[-16:]
+    ).lower()
+    is_short_continuation = bool(re.fullmatch(
+        r"\s*(?:ok(?:e|ay)?\s+)?(?:gas+|lanjut(?:kan)?|continue|proceed|jalan(?:kan)?|kerjain)\s*[.!]*\s*",
+        lower,
+    ))
+    unfinished_terms = (
+        "belum", "pending", "todo", "in_progress", "in progress", "lanjut",
+        "next turn", "belum ke-apply", "belum di-apply", "not applied",
+        "belum selesai", "unfinished", "remaining work",
+    )
+    continuation_code_change = (
+        is_short_continuation
+        and any(term in recent_history for term in code_terms)
+        and any(term in recent_history for term in mutation_terms)
+        and any(term in recent_history for term in unfinished_terms)
+    )
+    if continuation_code_change:
+        has_code = True
+        has_mutation = True
     intent = "analyze"
-    if any(term in lower for term in execute_terms):
+    if continuation_code_change:
+        intent = "mutate"
+    elif any(term in lower for term in execute_terms):
         intent = "execute"
     elif has_code and has_mutation:
         intent = "mutate"

@@ -158,6 +158,44 @@ def test_infer_turn_context_marks_code_mutation_and_live_verification_hints():
     assert context["intent"] in {"execute", "mutate"}
 
 
+def test_infer_turn_context_inherits_unfinished_coding_intent_for_short_continuation():
+    history = [
+        {"role": "user", "content": "Fix bot.py lalu test dan restart servicenya"},
+        {"role": "assistant", "content": "Code sudah dibaca, patch belum ke-apply dan smoke masih pending."},
+    ]
+
+    context = infer_turn_context("Gas", history=history, workspace_root="/tmp/repo")
+
+    assert context["hasFiles"] is True
+    assert context["hasCodeChangeIntent"] is True
+    assert context["intent"] == "mutate"
+
+
+def test_infer_turn_context_does_not_promote_casual_short_acknowledgement():
+    history = [
+        {"role": "user", "content": "Jelasin cuaca hari ini"},
+        {"role": "assistant", "content": "Cuaca cerah dan tidak ada pekerjaan tertunda."},
+    ]
+
+    context = infer_turn_context("Gas", history=history)
+
+    assert context["hasCodeChangeIntent"] is False
+    assert context["intent"] == "analyze"
+
+
+def test_infer_turn_context_estimate_includes_tool_calls_not_only_visible_text():
+    context = infer_turn_context(
+        "lanjut",
+        history=[{
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"name": "read_file", "arguments": {"path": "x" * 4_000}}],
+        }],
+    )
+
+    assert context["estimatedContextTokens"] >= 1_000
+
+
 def test_infer_turn_context_marks_explicit_boss_requests_without_matching_casual_boss_mentions():
     requested = infer_turn_context(
         "coba tanya agent boss ada ga caranya supaya private RPC lebih dekat dengan chain"
