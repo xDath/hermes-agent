@@ -6866,13 +6866,21 @@ def _gateway_command_inner(args):
                 print(f"✓ Stopped {get_service_name()} service")
 
     elif subcmd == "restart":
-        # Defense: refuse self-targeting gateway restart from inside the gateway.
-        # Prevents agent-initiated kill loops when combined with supervisor KeepAlive.
+        # A restart requested by a child command of the running gateway must not
+        # call systemctl/launchctl directly: the supervisor would SIGTERM the
+        # parent gateway and kill this child mid-command. Hand it back to the
+        # gateway via SIGUSR1 instead. The gateway drains the active run, exits
+        # with its planned-restart code, and the supervisor relaunches it.
         if os.getenv("_HERMES_GATEWAY") == "1":
+            from gateway.status import get_running_pid
+
+            pid = get_running_pid()
+            if pid is not None and _request_gateway_self_restart(pid):
+                print("✓ Gateway restart scheduled after the active run completes")
+                return
             print_error(
-                "Refusing to restart the gateway from inside the gateway process.\n"
-                "This command was blocked to prevent restart loops.\n"
-                "Use `hermes gateway restart` from a shell outside the running gateway."
+                "Could not schedule the gateway's graceful self-restart.\n"
+                "Run `hermes gateway restart` from an external shell."
             )
             sys.exit(1)
 

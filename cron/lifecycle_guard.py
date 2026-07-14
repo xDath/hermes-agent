@@ -45,6 +45,14 @@ class GatewayLifecycleBlocked(ValueError):
 # Shell-level command shapes that target the gateway lifecycle. Each branch
 # is anchored on a concrete command identifier so a match can only fire on
 # actual shell-command-shaped strings, not on prose.
+_GATEWAY_RESTART_ONLY_PATTERN = re.compile(
+    r"(?is)^\s*(?:sudo\s+)?(?:"
+    r"hermes(?:\s+(?:-p|--profile)\s+\S+)?\s+gateway\s+restart(?:\s+--system)?"
+    r"|systemctl(?:\s+--(?:user|system))?\s+restart\s+hermes[.\-]?gateway(?:\.service)?"
+    r")\s*;?\s*$"
+)
+
+
 _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     r"(?i)"
     # Branch A: `hermes gateway restart|stop` — the canonical foot-gun.
@@ -64,6 +72,13 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     r"|(?:p?kill\b[^\n]*\bhermes\b[^\n]*\bgateway)"
     r"|(?:p?kill\b[^\n]*\bgateway\b[^\n]*\bhermes)"
 )
+
+
+def is_gateway_restart_command(text: str) -> bool:
+    """Return True only for one standalone, safely handoff-able restart command."""
+    if not text:
+        return False
+    return bool(_GATEWAY_RESTART_ONLY_PATTERN.fullmatch(text))
 
 
 def contains_gateway_lifecycle_command(text: str) -> bool:
