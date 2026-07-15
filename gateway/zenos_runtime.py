@@ -742,6 +742,27 @@ def gateway_abort(
     )
 
 
+def omit_none_values(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return an API payload without explicit null optional fields.
+
+    Runtime schemas use omission to represent unavailable optional evidence.
+    Sending JSON null for an optional object is a different contract and can
+    trigger strict validation failures.
+    """
+    return {str(key): value for key, value in payload.items() if value is not None}
+
+
+def internal_continuation_prompt(postflight: Mapping[str, Any] | None) -> str:
+    """Extract a bounded, explicitly required internal Runtime continuation."""
+    if not isinstance(postflight, Mapping):
+        return ""
+    continuation = postflight.get("continuation")
+    if not isinstance(continuation, Mapping) or continuation.get("required") is not True:
+        return ""
+    prompt = str(continuation.get("prompt") or "").strip()
+    return prompt[:24_000]
+
+
 def gateway_postflight(
     payload: Mapping[str, Any],
     *,

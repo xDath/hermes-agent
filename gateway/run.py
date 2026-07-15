@@ -19860,6 +19860,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         bounded_tool_summary as _zenos_bounded_tool_summary,
                         format_execution_receipt as _zenos_format_execution_receipt,
                         gateway_postflight as _zenos_gateway_postflight,
+                        internal_continuation_prompt as _zenos_internal_continuation_prompt,
+                        omit_none_values as _zenos_omit_none_values,
                         workspace_state_snapshot as _zenos_workspace_state_snapshot,
                     )
 
@@ -19906,74 +19908,100 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             int((time.time() - _notify_start) * 1000),
                         ),
                     }
+                    # Runtime schemas distinguish an omitted optional object from
+                    # explicit JSON null.  Never send null workspace evidence:
+                    # this was the source of repeated live postflight 400s.
+                    _postflight_payload = _zenos_omit_none_values(_postflight_payload)
                     _postflight = await asyncio.to_thread(
                         _zenos_gateway_postflight,
                         _postflight_payload,
                         base_url=str((_zenos_settings or {}).get("url") or ""),
                         timeout=float((_zenos_settings or {}).get("timeout_seconds") or 180),
                     )
-                    _verified_answer = str(
-                        (_postflight or {}).get("finalAnswer") or _candidate_answer
-                    )
-                    if bool((_postflight or {}).get("failed")):
-                        response["failed"] = True
-                    _answer_changed = _verified_answer != _candidate_answer
-                    if _answer_changed:
-                        response["final_response"] = _verified_answer
-                        response["response_transformed"] = True
-                        _messages = response.get("messages")
-                        if isinstance(_messages, list):
-                            _assistant_replaced = False
-                            for _message in reversed(_messages):
-                                if not isinstance(_message, dict):
-                                    continue
-                                if (
-                                    not _assistant_replaced
-                                    and _message.get("role") == "assistant"
-                                    and not _message.get("tool_calls")
-                                ):
-                                    _message["content"] = _verified_answer
-                                    _assistant_replaced = True
-                                    continue
-                                if _assistant_replaced and _message.get("role") == "user":
-                                    # Never persist the ephemeral Runtime brief
-                                    # that was appended only for this Host turn.
-                                    _message["content"] = _zenos_original_message
-                                    break
-                            _transcript_session_id = str(
-                                response.get("session_id") or session_id
-                            )
-                            if _transcript_session_id:
-                                _rewrite_ok = self.session_store.rewrite_transcript(
-                                    _transcript_session_id,
-                                    _messages,
-                                )
-                                if not _rewrite_ok:
-                                    logger.warning(
-                                        "Zenos verified answer could not be written to canonical transcript for %s",
-                                        _transcript_session_id,
-                                    )
-                        self._evict_cached_agent(session_key)
+                    _continuation = (_postflight or {}).get("continuation")
+                    _continuation_prompt = _zenos_internal_continuation_prompt(_postflight)
 
-                    _receipt_text = _zenos_format_execution_receipt(
-                        (_postflight or {}).get("receipt"),
-                        str((_zenos_settings or {}).get("receipt") or "concise"),
-                    )
-                    if _receipt_text:
-                        response["final_response"] = (
-                            f"{str(response.get('final_response') or '')}\n\n"
-                            f"────────\n{_receipt_text}"
+                    if _continuation_prompt:
+                        # Keep one user command as one visible interaction. The
+                        # current draft is only an intermediate backend result;
+                        # queue an in-band Runtime continuation and suppress this
+                        # draft plus its receipt until the terminal turn finishes.
+                        response["zenos_continuation_prompt"] = _continuation_prompt
+                        response["final_response"] = ""
+                        response["response_transformed"] = False
+                        response["zenos_runtime"] = _postflight
+                        _answer_changed = False
+                        logger.info(
+                            "Zenos native postflight scheduled internal continuation: session=%s run=%s task=%s attempt=%s/%s",
+                            _postflight_payload["sessionId"],
+                            _postflight_payload["runId"],
+                            _continuation.get("taskId"),
+                            _continuation.get("attempt"),
+                            _continuation.get("maxAttempts"),
                         )
-                        response["response_transformed"] = True
-                    response["zenos_runtime"] = _postflight
-                    logger.info(
-                        "Zenos native postflight: session=%s run=%s transformed=%s verifier=%s boss=%s",
-                        _postflight_payload["sessionId"],
-                        _postflight_payload["runId"],
-                        _answer_changed,
-                        (((_postflight or {}).get("receipt") or {}).get("verifier") or {}).get("verdict"),
-                        (((_postflight or {}).get("receipt") or {}).get("boss") or {}).get("verdict"),
-                    )
+                    else:
+                        _verified_answer = str(
+                            (_postflight or {}).get("finalAnswer") or _candidate_answer
+                        )
+                        if bool((_postflight or {}).get("failed")):
+                            response["failed"] = True
+                        _answer_changed = _verified_answer != _candidate_answer
+                        if _answer_changed:
+                            response["final_response"] = _verified_answer
+                            response["response_transformed"] = True
+                            _messages = response.get("messages")
+                            if isinstance(_messages, list):
+                                _assistant_replaced = False
+                                for _message in reversed(_messages):
+                                    if not isinstance(_message, dict):
+                                        continue
+                                    if (
+                                        not _assistant_replaced
+                                        and _message.get("role") == "assistant"
+                                        and not _message.get("tool_calls")
+                                    ):
+                                        _message["content"] = _verified_answer
+                                        _assistant_replaced = True
+                                        continue
+                                    if _assistant_replaced and _message.get("role") == "user":
+                                        # Never persist the ephemeral Runtime brief
+                                        # that was appended only for this Host turn.
+                                        _message["content"] = _zenos_original_message
+                                        break
+                                _transcript_session_id = str(
+                                    response.get("session_id") or session_id
+                                )
+                                if _transcript_session_id:
+                                    _rewrite_ok = self.session_store.rewrite_transcript(
+                                        _transcript_session_id,
+                                        _messages,
+                                    )
+                                    if not _rewrite_ok:
+                                        logger.warning(
+                                            "Zenos verified answer could not be written to canonical transcript for %s",
+                                            _transcript_session_id,
+                                        )
+                            self._evict_cached_agent(session_key)
+
+                        _receipt_text = _zenos_format_execution_receipt(
+                            (_postflight or {}).get("receipt"),
+                            str((_zenos_settings or {}).get("receipt") or "concise"),
+                        )
+                        if _receipt_text:
+                            response["final_response"] = (
+                                f"{str(response.get('final_response') or '')}\n\n"
+                                f"────────\n{_receipt_text}"
+                            )
+                            response["response_transformed"] = True
+                        response["zenos_runtime"] = _postflight
+                        logger.info(
+                            "Zenos native postflight: session=%s run=%s transformed=%s verifier=%s boss=%s",
+                            _postflight_payload["sessionId"],
+                            _postflight_payload["runId"],
+                            _answer_changed,
+                            (((_postflight or {}).get("receipt") or {}).get("verifier") or {}).get("verdict"),
+                            (((_postflight or {}).get("receipt") or {}).get("boss") or {}).get("verdict"),
+                        )
                 except Exception as _zenos_postflight_error:
                     logger.exception("Zenos native postflight failed: %s", _zenos_postflight_error)
                     if not bool((_zenos_settings or {}).get("fail_open", True)):
@@ -19998,6 +20026,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     result_holder[0]["failed"] = bool(response.get("failed"))
                     if response.get("zenos_runtime") is not None:
                         result_holder[0]["zenos_runtime"] = response.get("zenos_runtime")
+                    if response.get("zenos_continuation_prompt"):
+                        result_holder[0]["zenos_continuation_prompt"] = response.get(
+                            "zenos_continuation_prompt"
+                        )
 
             # Check if we were interrupted OR have a queued message (/queue).
             result = result_holder[0]
@@ -20007,6 +20039,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Use session_key (not source.chat_id) to match adapter's storage keys.
             pending_event = None
             pending = None
+            _runtime_continuation_prompt = ""
+            _is_runtime_continuation = False
             if result and adapter and session_key:
                 pending_event = _dequeue_pending_event(adapter, session_key)
                 # /queue overflow: after consuming the adapter's "next-up"
@@ -20074,6 +20108,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if pending:
                         logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
 
+            # Zenos Runtime may request another bounded backend turn when the
+            # original user command is still unfinished after compaction or a
+            # failed deterministic validation. This continuation is internal:
+            # do not deliver the intermediate draft and do not require another
+            # user message.
+            if result and not pending and not pending_event:
+                _runtime_continuation_prompt = str(
+                    result.get("zenos_continuation_prompt") or ""
+                ).strip()
+                if _runtime_continuation_prompt:
+                    pending = _runtime_continuation_prompt
+                    _is_runtime_continuation = True
+                    logger.info(
+                        "Processing Zenos Runtime internal continuation for session %s at recursion depth %d",
+                        session_key or "?",
+                        _interrupt_depth + 1,
+                    )
+
             # Leftover /steer: if a steer arrived after the last tool batch
             # (e.g. during the final API call), the agent couldn't inject it
             # and returned it in result["pending_steer"]. Deliver it as the
@@ -20140,7 +20192,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return result_holder[0] or {"final_response": response, "messages": history}
 
                 was_interrupted = result.get("interrupted")
-                if not was_interrupted:
+                if not was_interrupted and not _is_runtime_continuation:
                     # Queued message after normal completion — deliver the first
                     # response before processing the queued follow-up.
                     # Skip if streaming already delivered it.
@@ -20206,9 +20258,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     await _bg_result
                             except Exception:
                                 pass
-                # else: interrupted — discard the interrupted response ("Operation
-                # interrupted." is just noise; the user already knows they sent a
-                # new message).
+                # else: interrupted or Runtime continuation — discard the
+                # intermediate response. The user sees only the terminal result
+                # of the original command.
 
                 updated_history = result.get("messages", history)
                 next_source = source
@@ -20288,6 +20340,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    # Keep Runtime's internal continuation prompt out of the
+                    # canonical transcript. The live API sees it, while the
+                    # persisted user row remains an empty internal turn.
+                    persist_user_message="" if _is_runtime_continuation else None,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

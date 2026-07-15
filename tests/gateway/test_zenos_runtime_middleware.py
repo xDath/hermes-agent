@@ -1,5 +1,6 @@
 """Unit tests for the native Hermes↔Zenos Runtime turn bridge helpers."""
 
+import inspect
 from pathlib import Path
 
 from gateway.zenos_runtime import (
@@ -9,13 +10,56 @@ from gateway.zenos_runtime import (
     format_execution_receipt,
     handoff_messages,
     infer_turn_context,
+    internal_continuation_prompt,
     middleware_settings,
     new_turn_id,
+    omit_none_values,
     resolve_workspace_root,
     restore_host_working_set_limit,
     runtime_session_id,
     usage_delta,
 )
+
+
+def test_postflight_payload_omits_unavailable_optional_workspace_state():
+    payload = omit_none_values({
+        "sessionId": "session-1",
+        "workspaceState": None,
+        "failed": False,
+    })
+
+    assert payload == {"sessionId": "session-1", "failed": False}
+
+
+def test_internal_continuation_prompt_requires_explicit_bounded_contract():
+    assert internal_continuation_prompt(None) == ""
+    assert internal_continuation_prompt({"continuation": {"required": False, "prompt": "ignore"}}) == ""
+    prompt = internal_continuation_prompt({
+        "continuation": {
+            "required": True,
+            "prompt": "  continue the same durable task  ",
+        }
+    })
+    assert prompt == "continue the same durable task"
+    assert len(internal_continuation_prompt({
+        "continuation": {"required": True, "prompt": "x" * 30_000}
+    })) == 24_000
+
+
+def test_runtime_continuation_is_queued_before_intermediate_delivery_and_kept_out_of_transcript():
+    from gateway.run import GatewayRunner
+
+    source = inspect.getsource(GatewayRunner._run_agent_inner)
+    queue_marker = 'result.get("zenos_continuation_prompt")'
+    delivery_marker = "if not was_interrupted and not _is_runtime_continuation:"
+    recursion_marker = "followup_result = await self._run_agent("
+    persistence_marker = 'persist_user_message="" if _is_runtime_continuation else None'
+
+    assert queue_marker in source
+    assert delivery_marker in source
+    assert recursion_marker in source
+    assert persistence_marker in source
+    assert source.index(queue_marker) < source.index(delivery_marker) < source.index(recursion_marker)
 
 
 def test_turn_usage_delta_separates_current_turn_from_session_totals():
