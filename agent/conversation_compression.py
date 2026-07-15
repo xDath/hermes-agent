@@ -628,15 +628,26 @@ def compress_context(
             except Exception as _rel_err:
                 logger.debug("compression lock release failed: %s", _rel_err)
 
-    # Notify external memory provider before compression discards context
+    # Notify external memory providers before compression discards context and
+    # preserve their returned continuity packet. The provider contract requires
+    # this text to participate in the summary prompt; discarding the return value
+    # makes durable checkpoints invisible to the compactor at the exact boundary
+    # where they are needed most.
+    memory_checkpoint = ""
     if agent._memory_manager:
         try:
-            agent._memory_manager.on_pre_compress(messages)
+            memory_checkpoint = agent._memory_manager.on_pre_compress(messages) or ""
         except Exception:
-            pass
+            memory_checkpoint = ""
 
     try:
-        compressed = agent.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic, force=force)
+        compressed = agent.context_compressor.compress(
+            messages,
+            current_tokens=approx_tokens,
+            focus_topic=focus_topic,
+            force=force,
+            checkpoint_context=memory_checkpoint,
+        )
     except TypeError:
         # Plugin context engine with strict signature that doesn't accept
         # focus_topic / force — fall back to calling without them.

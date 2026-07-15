@@ -40,7 +40,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # ── Activate venv ───────────────────────────────────────────────────────────
 VENV=""
 for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
-  if [ -f "$candidate/bin/activate" ]; then
+  if [ -f "$candidate/bin/activate" ] \
+      && "$candidate/bin/python" -m pytest --version >/dev/null 2>&1; then
     VENV="$candidate"
     break
   fi

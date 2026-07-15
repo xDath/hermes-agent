@@ -712,6 +712,28 @@ class TestNonStringContent:
         assert "Treat the conversation turns below as source material" in prompt
         assert "structured checkpoint summary" in prompt
 
+    def test_summary_prompt_includes_durable_memory_checkpoint(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "ok"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        messages = [
+            {"role": "user", "content": "fix src/app.py"},
+            {"role": "assistant", "content": "patch applied; validation pending"},
+        ]
+        checkpoint = "Zenos Memory checkpoint preserved before compression:\nfile=src/app.py phase=validation_pending"
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_call:
+            c._generate_summary(messages, checkpoint_context=checkpoint)
+
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        assert "DURABLE CONTINUITY CHECKPOINT" in prompt
+        assert checkpoint in prompt
+        assert "Never claim a patch or validation completed" in prompt
+
     def test_summary_call_passes_live_main_runtime(self):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]

@@ -12,6 +12,7 @@ from gateway.zenos_runtime import (
     middleware_settings,
     new_turn_id,
     resolve_workspace_root,
+    restore_host_working_set_limit,
     runtime_session_id,
     usage_delta,
 )
@@ -42,6 +43,8 @@ def test_turn_usage_delta_separates_current_turn_from_session_totals():
         "cacheWriteTokens": 0,
         "reasoningTokens": 9,
         "totalTokens": 1040,
+        "source": "hermes-session-delta",
+        "valid": True,
     }
 
 
@@ -116,10 +119,17 @@ def test_host_working_set_limit_only_lowers_existing_compressor_threshold():
     agent = Agent()
     applied = apply_host_working_set_limit(agent, 160_000)
 
-    assert applied == {"previous": 500_000, "applied": 160_000}
+    assert applied["applied"] is True
+    assert applied["previous"] == 500_000
+    assert applied["current"] == 160_000
     assert agent.context_compressor.threshold_tokens == 160_000
     assert agent.context_compressor.threshold_percent == 0.16
     assert agent.context_compressor.tail_token_budget == 40_000
+
+    restore_host_working_set_limit(agent, applied)
+    assert agent.context_compressor.threshold_tokens == 500_000
+    assert agent.context_compressor.threshold_percent == 0.5
+    assert agent.context_compressor.tail_token_budget == 100_000
 
 
 def test_workspace_resolution_prefers_explicit_repo_then_reuses_session_repo(tmp_path):

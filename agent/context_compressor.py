@@ -1748,6 +1748,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         self,
         turns_to_summarize: List[Dict[str, Any]],
         focus_topic: Optional[str] = None,
+        checkpoint_context: Optional[str] = None,
     ) -> Optional[str]:
         """Generate a structured summary of conversation turns.
 
@@ -1928,6 +1929,22 @@ TURNS TO SUMMARIZE:
 Use this exact structure:
 
 {_template_sections}"""
+
+        # Provider-produced continuity checkpoints are durable, bounded, and
+        # generated specifically for this compression boundary. Include them as
+        # authoritative source material so file state, blockers, decisions, and
+        # pending validation survive even when old raw tool output is pruned.
+        if checkpoint_context and checkpoint_context.strip():
+            bounded_checkpoint = checkpoint_context.strip()[:16_000]
+            prompt += f"""
+
+DURABLE CONTINUITY CHECKPOINT:
+{bounded_checkpoint}
+
+Treat this checkpoint as authoritative continuity evidence. Reconcile it with
+raw turns, preserve exact file paths, completed mutations, pending validation,
+blockers, and the next safe action. Never claim a patch or validation completed
+unless either the raw turns or this checkpoint explicitly says it completed."""
 
         # Inject focus topic guidance when the user provides one via /compress <focus>.
         # This goes at the end of the prompt so it takes precedence.
@@ -2123,7 +2140,11 @@ This compaction should PRIORITISE preserving all information related to the focu
                 else:
                     _reason = "timed out"
                 self._fallback_to_main_for_compression(e, _reason)
-                return self._generate_summary(turns_to_summarize, focus_topic=focus_topic)  # retry immediately
+                return self._generate_summary(
+                    turns_to_summarize,
+                    focus_topic=focus_topic,
+                    checkpoint_context=checkpoint_context,
+                )  # retry immediately
 
             # Unknown-error best-effort retry on main model.  Losing N turns of
             # context is almost always worse than one extra summary attempt, so
@@ -2140,7 +2161,11 @@ This compaction should PRIORITISE preserving all information related to the focu
                 and not getattr(self, "_summary_model_fallen_back", False)
             ):
                 self._fallback_to_main_for_compression(e, "failed")
-                return self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
+                return self._generate_summary(
+                    turns_to_summarize,
+                    focus_topic=focus_topic,
+                    checkpoint_context=checkpoint_context,
+                )
 
             # Transient errors (timeout, rate limit, network, JSON decode,
             # streaming premature-close) — shorter cooldown for JSON decode and
@@ -2790,7 +2815,14 @@ This compaction should PRIORITISE preserving all information related to the focu
     # Main compression entry point
     # ------------------------------------------------------------------
 
-    def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None, focus_topic: str = None, force: bool = False) -> List[Dict[str, Any]]:
+    def compress(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: int = None,
+        focus_topic: str = None,
+        force: bool = False,
+        checkpoint_context: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """Compress conversation messages by summarizing middle turns.
 
         Algorithm:
@@ -2932,7 +2964,11 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         # Phase 3: Generate structured summary
         summary_focus_topic = focus_topic or self._derive_auto_focus_topic(messages)
-        summary = self._generate_summary(turns_to_summarize, focus_topic=summary_focus_topic)
+        summary = self._generate_summary(
+            turns_to_summarize,
+            focus_topic=summary_focus_topic,
+            checkpoint_context=checkpoint_context,
+        )
 
         # If summary generation failed, behavior splits on
         # ``abort_on_summary_failure`` (config: compression.abort_on_summary_failure):

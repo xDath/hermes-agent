@@ -11,10 +11,12 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence
 
@@ -40,10 +42,20 @@ def agent_usage_snapshot(agent: Any) -> Dict[str, int]:
     }
 
 
-def usage_delta(before: Mapping[str, Any], after: Mapping[str, Any]) -> Dict[str, int]:
-    """Return usage attributable to one turn, never cumulative session totals."""
-    result = {
-        key: max(0, int(after.get(key, 0) or 0) - int(before.get(key, 0) or 0))
+def usage_delta(
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    *,
+    max_calls: int = 1,
+    context_length: int = 0,
+    max_output_tokens: int = 0,
+) -> Dict[str, Any]:
+    """Return one-turn usage with monotonic and aggregate plausibility checks."""
+    raw_before = {key: int(before.get(key, 0) or 0) for key in _USAGE_COUNTERS}
+    raw_after = {key: int(after.get(key, 0) or 0) for key in _USAGE_COUNTERS}
+    counter_regressions = [key for key in _USAGE_COUNTERS if raw_after[key] < raw_before[key]]
+    result: Dict[str, Any] = {
+        key: max(0, raw_after[key] - raw_before[key])
         for key in _USAGE_COUNTERS
     }
     result["totalTokens"] = (
@@ -52,6 +64,21 @@ def usage_delta(before: Mapping[str, Any], after: Mapping[str, Any]) -> Dict[str
         + result["cacheWriteTokens"]
         + result["outputTokens"]
     )
+    calls = max(1, min(int(max_calls or 1), 64))
+    effective_context = max(24_000, int(context_length or 0))
+    plausible_input = effective_context * calls * 2
+    plausible_output = max(4_096, int(max_output_tokens or 0) * calls * 2)
+    invalid_reason = ""
+    if counter_regressions:
+        invalid_reason = f"session usage counters regressed: {', '.join(counter_regressions)}"
+    elif result["inputTokens"] + result["cacheReadTokens"] + result["cacheWriteTokens"] > plausible_input:
+        invalid_reason = "aggregate input/cache usage exceeds context-by-call plausibility bound"
+    elif result["outputTokens"] > plausible_output:
+        invalid_reason = "aggregate output usage exceeds output-by-call plausibility bound"
+    result["source"] = "hermes-session-delta"
+    result["valid"] = not invalid_reason
+    if invalid_reason:
+        result["invalidReason"] = invalid_reason
     return result
 
 
@@ -365,36 +392,64 @@ def handoff_messages(
     return (head + tail)[-max_messages:]
 
 
-def apply_host_working_set_limit(agent: Any, soft_limit_tokens: int) -> Dict[str, int]:
-    """Lower the active compressor threshold to an absolute Host working set.
+def apply_host_working_set_limit(agent: Any, soft_limit_tokens: int) -> Dict[str, Any]:
+    """Apply one reversible Host working-set limit for the current turn only.
 
-    This does not delete stored history. It only causes Hermes' existing,
-    cache-aware context compression path to run before the prompt grows beyond
-    the configured working-set budget.
+    Cached agents are reused across gateway turns. Every compressor field changed
+    here is therefore captured and restored in ``finally``; otherwise one cheap
+    chat turn can permanently trap a later coding turn behind a tiny threshold.
     """
     compressor = getattr(agent, "context_compressor", None)
     if compressor is None:
-        return {"previous": 0, "applied": 0}
+        return {"applied": False, "previous": 0, "current": 0}
     try:
         context_length = max(1, int(getattr(compressor, "context_length", 0) or 0))
-        previous = max(1, int(getattr(compressor, "threshold_tokens", context_length) or context_length))
-        applied = max(24_000, min(int(soft_limit_tokens), context_length, previous))
-        if applied < previous:
-            compressor.threshold_tokens = applied
-            compressor.threshold_percent = applied / context_length
-
-            # ContextCompressor derives its post-compression tail budget only at
-            # construction time. Lowering threshold_tokens without updating the
-            # dependent budget causes compression thrashing: a 64K trigger can
-            # still target the old 40K tail. Keep the target proportional so a
-            # pressure event creates real headroom for several future turns.
+        previous_threshold = max(
+            1,
+            int(getattr(compressor, "threshold_tokens", context_length) or context_length),
+        )
+        requested = max(24_000, min(int(soft_limit_tokens), context_length - 1))
+        current = min(previous_threshold, requested)
+        state: Dict[str, Any] = {
+            "applied": True,
+            "previous": previous_threshold,
+            "current": current,
+            "previousThresholdPercent": getattr(compressor, "threshold_percent", None),
+            "previousTailTokenBudget": getattr(compressor, "tail_token_budget", None),
+            "previousWorkingSet": getattr(agent, "_zenos_host_working_set_tokens", None),
+        }
+        if current != previous_threshold:
+            compressor.threshold_tokens = current
+            compressor.threshold_percent = current / context_length
             ratio = float(getattr(compressor, "summary_target_ratio", 0.25) or 0.25)
             ratio = max(0.10, min(ratio, 0.40))
-            compressor.tail_token_budget = max(4_000, min(int(applied * ratio), applied - 1))
-        setattr(agent, "_zenos_host_working_set_tokens", applied)
-        return {"previous": previous, "applied": applied}
+            compressor.tail_token_budget = max(4_000, min(int(current * ratio), current - 1))
+        setattr(agent, "_zenos_host_working_set_tokens", current)
+        return state
     except Exception:
-        return {"previous": 0, "applied": 0}
+        return {"applied": False, "previous": 0, "current": 0}
+
+
+def restore_host_working_set_limit(agent: Any, state: Mapping[str, Any] | None) -> None:
+    """Restore compressor state captured by :func:`apply_host_working_set_limit`."""
+    if not isinstance(state, Mapping) or not state.get("applied"):
+        return
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is None:
+        return
+    compressor.threshold_tokens = int(state.get("previous") or compressor.threshold_tokens)
+    if state.get("previousThresholdPercent") is not None:
+        compressor.threshold_percent = state.get("previousThresholdPercent")
+    if state.get("previousTailTokenBudget") is not None:
+        compressor.tail_token_budget = state.get("previousTailTokenBudget")
+    previous_working_set = state.get("previousWorkingSet")
+    if previous_working_set is None:
+        try:
+            delattr(agent, "_zenos_host_working_set_tokens")
+        except AttributeError:
+            pass
+    else:
+        setattr(agent, "_zenos_host_working_set_tokens", previous_working_set)
 
 
 def infer_turn_context(
@@ -573,6 +628,70 @@ def workspace_root_from_text(text: str, *, allowed_parent: str = "/root/openclaw
     return ""
 
 
+def workspace_state_snapshot(workspace_root: str) -> Dict[str, Any] | None:
+    """Capture a bounded, non-secret Git/file state for transactional recovery."""
+    if not workspace_root:
+        return None
+    try:
+        root = Path(workspace_root).expanduser().resolve()
+        if not _is_repository_root(root):
+            return None
+
+        def git(*args: str) -> bytes:
+            completed = subprocess.run(
+                ["git", "-C", str(root), *args],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+            )
+            return completed.stdout if completed.returncode == 0 else b""
+
+        git_head = git("rev-parse", "HEAD").decode("utf-8", errors="replace").strip()
+        status = git("status", "--porcelain=v1", "-z")
+        paths: List[str] = []
+        for raw_entry in status.split(b"\0"):
+            if not raw_entry:
+                continue
+            entry = raw_entry.decode("utf-8", errors="replace")
+            candidate = entry[3:] if len(entry) > 3 else entry
+            if " -> " in candidate:
+                candidate = candidate.split(" -> ", 1)[1]
+            candidate = candidate.strip()
+            if candidate and candidate not in paths:
+                paths.append(candidate)
+        diff_material = b"\n".join([
+            git("diff", "--binary", "--no-ext-diff", "HEAD", "--"),
+            status,
+        ])
+        changed_files: List[Dict[str, Any]] = []
+        for relative in paths[:200]:
+            try:
+                absolute = (root / relative).resolve()
+                absolute.relative_to(root)
+            except Exception:
+                continue
+            exists = absolute.is_file()
+            item: Dict[str, Any] = {"path": relative, "exists": exists}
+            if exists and absolute.stat().st_size <= 20_000_000:
+                digest = hashlib.sha256()
+                with absolute.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                item["sha256"] = digest.hexdigest()
+            changed_files.append(item)
+        return {
+            "workspaceRoot": str(root),
+            "gitHead": git_head,
+            "dirtyDiffSha256": hashlib.sha256(diff_material).hexdigest(),
+            "changedFiles": changed_files,
+            "clean": not bool(paths),
+            "capturedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+    except Exception:
+        return None
+
+
 def new_turn_id(session_id: str) -> str:
     safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in session_id)
     return f"{safe[:80]}_{uuid.uuid4().hex[:20]}"
@@ -586,6 +705,36 @@ def gateway_preflight(
 ) -> Dict[str, Any]:
     return _json_request(
         f"{_runtime_url(base_url)}/api/runtime/gateway/preflight",
+        api_key=_runtime_key(),
+        method="POST",
+        body=dict(payload),
+        timeout=timeout,
+    )
+
+
+def gateway_heartbeat(
+    payload: Mapping[str, Any],
+    *,
+    base_url: str = "",
+    timeout: float = 30.0,
+) -> Dict[str, Any]:
+    return _json_request(
+        f"{_runtime_url(base_url)}/api/runtime/gateway/heartbeat",
+        api_key=_runtime_key(),
+        method="POST",
+        body=dict(payload),
+        timeout=timeout,
+    )
+
+
+def gateway_abort(
+    payload: Mapping[str, Any],
+    *,
+    base_url: str = "",
+    timeout: float = DEFAULT_MIDDLEWARE_TIMEOUT,
+) -> Dict[str, Any]:
+    return _json_request(
+        f"{_runtime_url(base_url)}/api/runtime/gateway/abort",
         api_key=_runtime_key(),
         method="POST",
         body=dict(payload),

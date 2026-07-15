@@ -16954,6 +16954,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _zenos_settings = None
         _zenos_host_model = ""
         _zenos_host_provider = ""
+        _zenos_workspace_root = ""
+        _zenos_workspace_state_before = None
         _zenos_original_message = message
         try:
             from gateway.zenos_runtime import (
@@ -16965,6 +16967,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 new_turn_id as _zenos_new_turn_id,
                 resolve_workspace_root as _zenos_resolve_workspace_root,
                 runtime_session_id as _zenos_runtime_session_id,
+                workspace_state_snapshot as _zenos_workspace_state_snapshot,
             )
 
             _zenos_settings = _zenos_middleware_settings(user_config)
@@ -16991,6 +16994,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 if _workspace_root:
                     _workspace_cache[session_key or session_id] = _workspace_root
+                _zenos_workspace_root = _workspace_root
+                _zenos_workspace_state_before = await asyncio.to_thread(
+                    _zenos_workspace_state_snapshot,
+                    _workspace_root,
+                ) if _workspace_root else None
                 _runtime_id = _zenos_runtime_session_id(session_key or session_id)
                 _turn_id = _zenos_new_turn_id(session_id)
                 _routing_hints = _zenos_infer_turn_context(
@@ -17022,6 +17030,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     ),
                     "handoffMessages": _handoff_messages,
                     "workspaceRoot": _workspace_root or None,
+                    "workspaceState": _zenos_workspace_state_before,
                     **_routing_hints,
                 }
                 # Remove None so strict Runtime schemas only see declared values.
@@ -18892,21 +18901,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             _zenos_usage_before = None
             _zenos_host_budget_state = None
+            _zenos_working_set_state = None
+            _zenos_heartbeat_stop = None
+            _zenos_heartbeat_thread = None
             if _zenos_turn:
                 from gateway.zenos_runtime import (
                     apply_host_token_budget as _zenos_apply_host_token_budget,
                     agent_usage_snapshot as _zenos_agent_usage_snapshot,
                     apply_host_working_set_limit as _zenos_apply_host_working_set_limit,
                 )
-                _working_set = _zenos_apply_host_working_set_limit(
+                _zenos_working_set_state = _zenos_apply_host_working_set_limit(
                     agent,
-                    int((_zenos_settings or {}).get("context_soft_limit_tokens") or 160_000),
+                    int(
+                        (_zenos_turn or {}).get("hostWorkingSetTokens")
+                        or (_zenos_settings or {}).get("context_soft_limit_tokens")
+                        or 160_000
+                    ),
                 )
-                if _working_set.get("applied") and _working_set.get("applied") != _working_set.get("previous"):
+                if (
+                    _zenos_working_set_state.get("applied")
+                    and _zenos_working_set_state.get("current")
+                    != _zenos_working_set_state.get("previous")
+                ):
                     logger.info(
-                        "Zenos Host working set lowered: previous=%s applied=%s",
-                        _working_set.get("previous"),
-                        _working_set.get("applied"),
+                        "Zenos Host working set lowered for this turn: previous=%s current=%s",
+                        _zenos_working_set_state.get("previous"),
+                        _zenos_working_set_state.get("current"),
                     )
                 _zenos_usage_before = _zenos_agent_usage_snapshot(agent)
                 _zenos_host_budget_state = _zenos_apply_host_token_budget(
@@ -18920,6 +18940,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _zenos_host_budget_state.get("maxIterations"),
                         _zenos_host_budget_state.get("maxTokens"),
                     )
+
+                # Keep the Runtime lease alive while a long tool/model loop is
+                # active. A separate daemon thread is used because the Host run
+                # is synchronous and can legitimately occupy this worker for
+                # many minutes during coding, builds, or remote validation.
+                _zenos_heartbeat_stop = threading.Event()
+
+                def _zenos_heartbeat_loop():
+                    from gateway.zenos_runtime import gateway_heartbeat as _zenos_gateway_heartbeat
+                    while not _zenos_heartbeat_stop.wait(60.0):
+                        try:
+                            _zenos_gateway_heartbeat(
+                                {
+                                    "sessionId": str((_zenos_turn or {}).get("sessionId") or ""),
+                                    "runId": str((_zenos_turn or {}).get("runId") or ""),
+                                    "turnId": str((_zenos_turn or {}).get("turnId") or ""),
+                                    "leaseMs": 10 * 60_000,
+                                },
+                                base_url=str((_zenos_settings or {}).get("url") or ""),
+                                timeout=20.0,
+                            )
+                        except Exception as _heartbeat_error:
+                            logger.warning("Zenos Runtime heartbeat failed: %s", _heartbeat_error)
+
+                _zenos_heartbeat_thread = threading.Thread(
+                    target=_zenos_heartbeat_loop,
+                    name=f"zenos-heartbeat-{session_id}",
+                    daemon=True,
+                )
+                _zenos_heartbeat_thread.start()
 
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
@@ -18978,9 +19028,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         usage_delta as _zenos_usage_delta,
                         workspace_root_from_text as _zenos_workspace_root_from_text,
                     )
+                    _host_budget = (_zenos_turn or {}).get("hostBudget") or {}
                     result["zenos_turn_usage"] = _zenos_usage_delta(
                         _zenos_usage_before,
                         _zenos_agent_usage_snapshot(agent),
+                        max_calls=int(_host_budget.get("maxCalls") or 1),
+                        context_length=int(
+                            getattr(getattr(agent, "context_compressor", None), "context_length", 0) or 0
+                        ),
+                        max_output_tokens=int(_host_budget.get("maxOutputTokens") or 0),
                     )
                     try:
                         _observed_workspace = _zenos_workspace_root_from_text(
@@ -18994,13 +19050,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _workspace_cache[session_key or session_id] = _observed_workspace
                     except Exception:
                         pass
+            except BaseException as _agent_run_error:
+                if _zenos_turn:
+                    try:
+                        from gateway.zenos_runtime import gateway_abort as _zenos_gateway_abort
+                        _zenos_gateway_abort(
+                            {
+                                "sessionId": str((_zenos_turn or {}).get("sessionId") or ""),
+                                "runId": str((_zenos_turn or {}).get("runId") or ""),
+                                "turnId": str((_zenos_turn or {}).get("turnId") or ""),
+                                "reason": f"Hermes Host exited before postflight: {type(_agent_run_error).__name__}",
+                            },
+                            base_url=str((_zenos_settings or {}).get("url") or ""),
+                            timeout=min(30.0, float((_zenos_settings or {}).get("timeout_seconds") or 30)),
+                        )
+                    except Exception:
+                        logger.exception("Failed to abandon interrupted Zenos Runtime run")
+                raise
             finally:
+                if _zenos_heartbeat_stop is not None:
+                    _zenos_heartbeat_stop.set()
+                if _zenos_heartbeat_thread is not None:
+                    _zenos_heartbeat_thread.join(timeout=2.0)
                 if _zenos_host_budget_state:
                     try:
                         from gateway.zenos_runtime import restore_host_token_budget as _zenos_restore_host_token_budget
                         _zenos_restore_host_token_budget(agent, _zenos_host_budget_state)
                     except Exception:
                         logger.exception("Failed to restore Hermes Host token budget state")
+                if _zenos_working_set_state:
+                    try:
+                        from gateway.zenos_runtime import restore_host_working_set_limit as _zenos_restore_host_working_set_limit
+                        _zenos_restore_host_working_set_limit(agent, _zenos_working_set_state)
+                    except Exception:
+                        logger.exception("Failed to restore Hermes Host working-set state")
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
                 # threads don't hang past the end of the run (interrupt,
@@ -19777,9 +19860,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         bounded_tool_summary as _zenos_bounded_tool_summary,
                         format_execution_receipt as _zenos_format_execution_receipt,
                         gateway_postflight as _zenos_gateway_postflight,
+                        workspace_state_snapshot as _zenos_workspace_state_snapshot,
                     )
 
                     _candidate_answer = str(response.get("final_response") or "")
+                    _workspace_state_after = await asyncio.to_thread(
+                        _zenos_workspace_state_snapshot,
+                        _zenos_workspace_root,
+                    ) if _zenos_workspace_root else None
                     _turn_usage = response.get("zenos_turn_usage")
                     if not isinstance(_turn_usage, dict):
                         _turn_usage = {
@@ -19799,6 +19887,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "provider": _zenos_host_provider or "default",
                         },
                         "toolSummary": _zenos_bounded_tool_summary(response.get("tools")),
+                        "workspaceState": _workspace_state_after,
                         "failed": bool(response.get("failed")),
                         "hostUsage": {
                             "inputTokens": max(0, int(_turn_usage.get("inputTokens") or 0)),
@@ -19807,6 +19896,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "cacheWriteTokens": max(0, int(_turn_usage.get("cacheWriteTokens") or 0)),
                             "reasoningTokens": max(0, int(_turn_usage.get("reasoningTokens") or 0)),
                             "calls": max(0, int(response.get("api_calls") or 0)),
+                            "source": str(_turn_usage.get("source") or "hermes-session-delta"),
+                            "valid": bool(_turn_usage.get("valid", True)),
+                            "invalidReason": str(_turn_usage.get("invalidReason") or ""),
+                            "providerRequestId": str(_turn_usage.get("providerRequestId") or ""),
                         },
                         "hostDurationMs": max(
                             0,

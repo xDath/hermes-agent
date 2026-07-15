@@ -1,7 +1,7 @@
 [Unit]
 Description=Hermes Agent Gateway - Zenos Profile
-After=network-online.target zenos-runtime.service zenos-memory.service
-Wants=network-online.target zenos-runtime.service zenos-memory.service
+After=network-online.target zenos-runtime.service srv-etla-workspaces.mount etla-ops-broker.service
+Wants=network-online.target zenos-runtime.service srv-etla-workspaces.mount etla-ops-broker.service
 StartLimitIntervalSec=0
 
 [Service]
@@ -14,28 +14,39 @@ Environment=USER=hermes
 Environment=LOGNAME=hermes
 Environment=PATH=/usr/local/lib/hermes-agent/venv/bin:/usr/local/lib/hermes-agent/node_modules/.bin:/usr/local/bin:/usr/bin:/bin
 Environment=VIRTUAL_ENV=/usr/local/lib/hermes-agent/venv
+Environment=PYTHONPATH=/usr/local/lib/hermes-agent/venv/lib/python3.11/site-packages:/usr/local/lib/hermes-agent
 Environment=HERMES_HOME=/var/lib/hermes/.hermes/profiles/zenos
-LoadCredentialEncrypted=zenos-runtime.env:/etc/credstore.encrypted/zenos-runtime.env.cred
-ExecStart=/usr/local/lib/hermes-agent/venv/bin/python /usr/local/lib/hermes-agent/scripts/run_gateway_with_credential.py
+Environment=HERMES_CREDENTIAL_NAME=hermes-zenos.env
+LoadCredentialEncrypted=hermes-zenos.env:/etc/credstore.encrypted/hermes-zenos.env.cred
+ExecStart=/usr/local/lib/hermes-python/bin/python3.11 /usr/local/sbin/run-hermes-gateway-with-credential
 Restart=always
 RestartSec=5
 RestartForceExitStatus=75
 KillMode=mixed
 KillSignal=SIGTERM
 ExecReload=/bin/kill -USR1 $MAINPID
-ExecStopPost=-/usr/local/lib/hermes-agent/venv/bin/python -m gateway.cgroup_cleanup
+ExecStopPost=-/usr/local/lib/hermes-python/bin/python3.11 -m gateway.cgroup_cleanup
 TimeoutStopSec=210
 UMask=0077
-StateDirectory=hermes
-StateDirectoryMode=0700
 NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
 PrivateTmp=true
-ProtectSystem=full
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/usr/local/lib/hermes-agent /usr/local/lib/hermes-python /opt/zenos-runtime/current
+ReadWritePaths=/var/lib/hermes /srv/etla/workspaces
 ProtectHostname=true
 ProtectClock=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectProc=invisible
+ProcSubset=all
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
 RestrictSUIDSGID=true
 LockPersonality=true
 RestrictRealtime=true
