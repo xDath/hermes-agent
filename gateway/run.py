@@ -7353,6 +7353,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # idle case where the subagent finishes with no agent turn running.
         asyncio.create_task(self._async_delegation_watcher())
 
+        # Recover durable Zenos continuation capsules after a gateway/service
+        # restart. Runtime owns the queue/lease; the gateway only maps the
+        # persisted session key back to its Telegram/WhatsApp/etc. origin and
+        # injects the internal prompt. User-visible interaction remains one
+        # root request with one terminal response.
+        asyncio.create_task(self._zenos_continuation_watcher())
+
         # Start the scale-to-zero idle watcher ONLY when this instance is opted
         # in (the NAS "Labs" HERMES_SCALE_TO_ZERO stamp), messaging is
         # relay-only/absent, and a wakeUrl is registered (decisions.md D1/D11/
@@ -9787,9 +9794,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "model":
             return await self._handle_model_command(event)
 
-        if canonical == "wmodel":
-            return await self._handle_wmodel_command(event)
-
         if canonical == "codex-runtime":
             return await self._handle_codex_runtime_command(event)
 
@@ -11509,6 +11513,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_text = _clean_message_text
         except Exception as _ts_err:
             logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
+
+        # Recovered Zenos continuation prompts are control-plane state, not new
+        # user intent. Keep the prompt visible to the live Host call while
+        # suppressing its user row in the canonical transcript.
+        if (
+            getattr(event, "internal", False)
+            and str((getattr(event, "metadata", None) or {}).get("zenos_continuation_id") or "").strip()
+        ):
+            persist_user_message = ""
+            persist_user_timestamp = None
 
         # Bind this gateway run generation to the adapter's active-session
         # event so deferred post-delivery callbacks can be released by the
@@ -15394,6 +15408,87 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if parsed.get("thread_id"):
             evt["thread_id"] = parsed["thread_id"]
 
+    async def _zenos_continuation_watcher(self, interval: float = 20.0) -> None:
+        """Recover durable Runtime continuations across gateway restarts.
+
+        The queue is leased in Zenos Runtime, while this watcher is only the
+        delivery adapter. A continuation carries no new user intent and is
+        marked internal so platform authorization and user transcript writes
+        cannot mistake it for a fresh command.
+        """
+        # Capture the process boundary before the startup delay. Only leases
+        # last touched by an older gateway are recoverable; leases created or
+        # renewed by this process remain protected from the watcher.
+        restart_recovery_cutoff = datetime.now().astimezone().isoformat()
+        await asyncio.sleep(4)
+        try:
+            from gateway.zenos_runtime import (
+                claim_gateway_continuation,
+                runtime_session_id,
+            )
+        except Exception as exc:
+            logger.debug("Zenos continuation watcher unavailable: %s", exc)
+            return
+
+        while self._running:
+            try:
+                entries = self.session_store.list_sessions(active_minutes=14 * 24 * 60)[:200]
+                for entry in entries:
+                    source = getattr(entry, "origin", None)
+                    session_key = str(getattr(entry, "session_key", "") or "")
+                    if not source or not session_key:
+                        continue
+                    adapter = self.adapters.get(getattr(source, "platform", None))
+                    if adapter is None:
+                        continue
+                    runtime_sid = runtime_session_id(session_key)
+                    try:
+                        claimed = await asyncio.to_thread(
+                            claim_gateway_continuation,
+                            runtime_sid,
+                            recover_leased_before=restart_recovery_cutoff,
+                            lease_owner=f"hermes-gateway:{os.getpid()}:restart-watcher",
+                            timeout=15.0,
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "Zenos continuation claim failed for %s: %s",
+                            runtime_sid,
+                            exc,
+                        )
+                        continue
+                    continuation = claimed.get("continuation") if isinstance(claimed, dict) else None
+                    if not isinstance(continuation, dict):
+                        continue
+                    prompt = str(continuation.get("prompt") or "").strip()
+                    continuation_id = str(continuation.get("continuationId") or "").strip()
+                    continuation_token = str(continuation.get("leaseToken") or "").strip()
+                    if not prompt or not continuation_id or not continuation_token:
+                        continue
+                    event = MessageEvent(
+                        text=prompt,
+                        message_type=MessageType.TEXT,
+                        source=source,
+                        internal=True,
+                        metadata={
+                            "zenos_continuation_id": continuation_id,
+                            "zenos_continuation_token": continuation_token,
+                            "zenos_cognitive_task_id": str(continuation.get("taskId") or ""),
+                            "zenos_recovered_after_restart": True,
+                        },
+                    )
+                    logger.info(
+                        "Recovering Zenos continuation %s for session %s attempt=%s/%s",
+                        continuation_id,
+                        session_key,
+                        continuation.get("attempt"),
+                        continuation.get("maxAttempts"),
+                    )
+                    await adapter.handle_message(event)
+            except Exception as exc:
+                logger.debug("Zenos continuation watcher error: %s", exc)
+            await asyncio.sleep(interval)
+
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async-delegation completions and inject them as new turns.
 
@@ -16959,6 +17054,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _zenos_original_message = message
         try:
             from gateway.zenos_runtime import (
+                authoritative_host_override as _zenos_authoritative_host_override,
                 compact_history as _zenos_compact_history,
                 gateway_preflight as _zenos_gateway_preflight,
                 handoff_messages as _zenos_handoff_messages,
@@ -17044,6 +17140,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     base_url=str(_zenos_settings.get("url") or ""),
                     timeout=float(_zenos_settings.get("timeout_seconds") or 180),
                 )
+                _runtime_host_override = _zenos_authoritative_host_override(
+                    _zenos_turn,
+                    _zenos_settings,
+                )
+                if _runtime_host_override:
+                    _selected_provider = _runtime_host_override["provider"]
+                    _selected_model = _runtime_host_override["model"]
+                    _selected_runtime = _resolve_runtime_agent_kwargs_for_provider(
+                        _selected_provider
+                    )
+                    _selected_runtime_model = _selected_runtime.pop("model", None)
+                    if _selected_runtime.get("api_key") or _selected_runtime.get("command"):
+                        logger.info(
+                            "Zenos Runtime Host authority applied: %s/%s -> %s/%s",
+                            _zenos_host_provider,
+                            _zenos_host_model,
+                            _selected_provider,
+                            _selected_model,
+                        )
+                        model = _selected_model or _selected_runtime_model or model
+                        runtime_kwargs = _selected_runtime
+                        _zenos_host_model = model
+                        _zenos_host_provider = _selected_provider
+                    else:
+                        logger.error(
+                            "Zenos Runtime selected Host %s/%s but Hermes has no usable provider credentials; keeping %s/%s",
+                            _selected_provider,
+                            _selected_model,
+                            _zenos_host_provider,
+                            _zenos_host_model,
+                        )
                 _host_context = str((_zenos_turn or {}).get("hostContext") or "").strip()
                 if _host_context:
                     # Keep the internal brief ephemeral: persist only the real
@@ -18917,6 +19044,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         or (_zenos_settings or {}).get("context_soft_limit_tokens")
                         or 160_000
                     ),
+                    enforce=bool(
+                        (_zenos_settings or {}).get("enforce_host_working_set_limit", False)
+                    ),
                 )
                 if (
                     _zenos_working_set_state.get("applied")
@@ -18932,6 +19062,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _zenos_host_budget_state = _zenos_apply_host_token_budget(
                     agent,
                     (_zenos_turn or {}).get("hostBudget"),
+                    enforce=bool(
+                        (_zenos_settings or {}).get("enforce_host_token_budget", False)
+                    ),
                 )
                 if _zenos_host_budget_state.get("applied"):
                     logger.info(
@@ -19860,8 +19993,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         bounded_tool_summary as _zenos_bounded_tool_summary,
                         format_execution_receipt as _zenos_format_execution_receipt,
                         gateway_postflight as _zenos_gateway_postflight,
+                        heartbeat_gateway_continuation as _zenos_heartbeat_gateway_continuation,
+                        complete_gateway_continuation as _zenos_complete_gateway_continuation,
+                        internal_continuation_id as _zenos_internal_continuation_id,
                         internal_continuation_prompt as _zenos_internal_continuation_prompt,
+                        internal_continuation_token as _zenos_internal_continuation_token,
                         omit_none_values as _zenos_omit_none_values,
+                        structured_execution_receipts as _zenos_structured_execution_receipts,
                         workspace_state_snapshot as _zenos_workspace_state_snapshot,
                     )
 
@@ -19879,6 +20017,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "cacheWriteTokens": max(0, int(response.get("cache_write_tokens") or 0)),
                             "reasoningTokens": max(0, int(response.get("reasoning_tokens") or 0)),
                         }
+                    _execution_messages = response.get("messages")
+                    _history_offset = max(0, int(response.get("history_offset") or 0))
+                    _execution_receipts = _zenos_structured_execution_receipts(
+                        _execution_messages,
+                        history_offset=_history_offset,
+                        workspace_before=_zenos_workspace_state_before,
+                        workspace_after=_workspace_state_after,
+                    )
                     _postflight_payload = {
                         "sessionId": str((_zenos_turn or {}).get("sessionId") or ""),
                         "runId": str((_zenos_turn or {}).get("runId") or ""),
@@ -19888,7 +20034,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "model": str(response.get("model") or _zenos_host_model or "unknown"),
                             "provider": _zenos_host_provider or "default",
                         },
-                        "toolSummary": _zenos_bounded_tool_summary(response.get("tools")),
+                        "toolSummary": _zenos_bounded_tool_summary(
+                            _execution_messages,
+                            history_offset=_history_offset,
+                        ),
+                        "executionReceipts": _execution_receipts,
                         "workspaceState": _workspace_state_after,
                         "failed": bool(response.get("failed")),
                         "hostUsage": {
@@ -19920,13 +20070,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     _continuation = (_postflight or {}).get("continuation")
                     _continuation_prompt = _zenos_internal_continuation_prompt(_postflight)
+                    _continuation_id = _zenos_internal_continuation_id(_postflight)
+                    _continuation_token = _zenos_internal_continuation_token(_postflight)
 
-                    if _continuation_prompt:
+                    if _continuation_prompt and _continuation_id and _continuation_token:
                         # Keep one user command as one visible interaction. The
                         # current draft is only an intermediate backend result;
                         # queue an in-band Runtime continuation and suppress this
                         # draft plus its receipt until the terminal turn finishes.
                         response["zenos_continuation_prompt"] = _continuation_prompt
+                        response["zenos_continuation_id"] = _continuation_id
+                        response["zenos_continuation_token"] = _continuation_token
                         response["final_response"] = ""
                         response["response_transformed"] = False
                         response["zenos_runtime"] = _postflight
@@ -20030,6 +20184,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         result_holder[0]["zenos_continuation_prompt"] = response.get(
                             "zenos_continuation_prompt"
                         )
+                        result_holder[0]["zenos_continuation_id"] = response.get(
+                            "zenos_continuation_id"
+                        )
+                        result_holder[0]["zenos_continuation_token"] = response.get(
+                            "zenos_continuation_token"
+                        )
 
             # Check if we were interrupted OR have a queued message (/queue).
             result = result_holder[0]
@@ -20040,6 +20200,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pending_event = None
             pending = None
             _runtime_continuation_prompt = ""
+            _runtime_continuation_id = ""
+            _runtime_continuation_token = ""
             _is_runtime_continuation = False
             if result and adapter and session_key:
                 pending_event = _dequeue_pending_event(adapter, session_key)
@@ -20118,8 +20280,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     result.get("zenos_continuation_prompt") or ""
                 ).strip()
                 if _runtime_continuation_prompt:
-                    pending = _runtime_continuation_prompt
-                    _is_runtime_continuation = True
+                    _runtime_continuation_id = str(
+                        result.get("zenos_continuation_id") or ""
+                    ).strip()
+                    _runtime_continuation_token = str(
+                        result.get("zenos_continuation_token") or ""
+                    ).strip()
+                    if _runtime_continuation_id and _runtime_continuation_token:
+                        pending = _runtime_continuation_prompt
+                        _is_runtime_continuation = True
+                    else:
+                        logger.error(
+                            "Discarding Runtime continuation without a complete lease contract for session %s",
+                            session_key or "?",
+                        )
                     logger.info(
                         "Processing Zenos Runtime internal continuation for session %s at recursion depth %d",
                         session_key or "?",
@@ -20329,22 +20503,77 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
-                followup_result = await self._run_agent(
-                    message=next_message,
-                    context_prompt=context_prompt,
-                    history=updated_history,
-                    source=next_source,
-                    session_id=session_id,
-                    session_key=next_session_key,
-                    run_generation=run_generation,
-                    _interrupt_depth=_interrupt_depth + 1,
-                    event_message_id=next_message_id,
-                    channel_prompt=next_channel_prompt,
-                    # Keep Runtime's internal continuation prompt out of the
-                    # canonical transcript. The live API sees it, while the
-                    # persisted user row remains an empty internal turn.
-                    persist_user_message="" if _is_runtime_continuation else None,
-                )
+                _continuation_heartbeat_task = None
+                if _is_runtime_continuation and _runtime_continuation_id and _runtime_continuation_token:
+                    async def _renew_runtime_continuation_lease() -> None:
+                        while True:
+                            await asyncio.sleep(5 * 60)
+                            try:
+                                await asyncio.to_thread(
+                                    _zenos_heartbeat_gateway_continuation,
+                                    _runtime_continuation_id,
+                                    lease_token=_runtime_continuation_token,
+                                    base_url=str((_zenos_settings or {}).get("url") or ""),
+                                    timeout=30.0,
+                                )
+                            except Exception as _heartbeat_error:
+                                logger.warning(
+                                    "Zenos continuation heartbeat failed for %s: %s",
+                                    _runtime_continuation_id,
+                                    _heartbeat_error,
+                                )
+                    _continuation_heartbeat_task = asyncio.create_task(
+                        _renew_runtime_continuation_lease()
+                    )
+                try:
+                    followup_result = await self._run_agent(
+                        message=next_message,
+                        context_prompt=context_prompt,
+                        history=updated_history,
+                        source=next_source,
+                        session_id=session_id,
+                        session_key=next_session_key,
+                        run_generation=run_generation,
+                        _interrupt_depth=_interrupt_depth + 1,
+                        event_message_id=next_message_id,
+                        channel_prompt=next_channel_prompt,
+                        # Keep Runtime's internal continuation prompt out of the
+                        # canonical transcript. The live API sees it, while the
+                        # persisted user row remains an empty internal turn.
+                        persist_user_message="" if _is_runtime_continuation else None,
+                    )
+                finally:
+                    if _continuation_heartbeat_task is not None:
+                        _continuation_heartbeat_task.cancel()
+                        try:
+                            await _continuation_heartbeat_task
+                        except asyncio.CancelledError:
+                            pass
+                if _is_runtime_continuation and _runtime_continuation_id and _runtime_continuation_token:
+                    try:
+                        await asyncio.to_thread(
+                            _zenos_complete_gateway_continuation,
+                            _runtime_continuation_id,
+                            lease_token=_runtime_continuation_token,
+                            cancelled=bool(
+                                isinstance(followup_result, dict)
+                                and (
+                                    followup_result.get("failed")
+                                    or followup_result.get("interrupted")
+                                )
+                            ),
+                            base_url=str((_zenos_settings or {}).get("url") or ""),
+                            timeout=30.0,
+                        )
+                    except Exception as _continuation_ack_error:
+                        # The Runtime lease will expire and make the durable
+                        # continuation claimable again after a gateway crash or
+                        # transient acknowledgement failure.
+                        logger.warning(
+                            "Zenos continuation acknowledgement failed for %s: %s",
+                            _runtime_continuation_id,
+                            _continuation_ack_error,
+                        )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
             # Stop progress sender, interrupt monitor, and notification task

@@ -4810,6 +4810,68 @@ class BasePlatformAdapter(ABC):
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
+        _zenos_continuation_id = str(
+            (event.metadata or {}).get("zenos_continuation_id") or ""
+        ).strip()
+        _zenos_continuation_token = str(
+            (event.metadata or {}).get("zenos_continuation_token") or ""
+        ).strip()
+        _zenos_continuation_acked = False
+
+        async def _ack_zenos_continuation(*, cancelled: bool) -> None:
+            nonlocal _zenos_continuation_acked
+            if (
+                not _zenos_continuation_id
+                or not _zenos_continuation_token
+                or _zenos_continuation_acked
+            ):
+                return
+            try:
+                from gateway.zenos_runtime import complete_gateway_continuation
+
+                await asyncio.to_thread(
+                    complete_gateway_continuation,
+                    _zenos_continuation_id,
+                    lease_token=_zenos_continuation_token,
+                    cancelled=cancelled,
+                    timeout=30.0,
+                )
+                _zenos_continuation_acked = True
+            except Exception as exc:
+                # Leave the Runtime lease to expire so restart recovery can
+                # claim the continuation again instead of losing active work.
+                logger.warning(
+                    "[%s] Zenos continuation acknowledgement failed for %s: %s",
+                    self.name,
+                    _zenos_continuation_id,
+                    exc,
+                )
+
+        _zenos_continuation_heartbeat_task: Optional[asyncio.Task] = None
+        if _zenos_continuation_id and _zenos_continuation_token:
+            async def _heartbeat_zenos_continuation() -> None:
+                from gateway.zenos_runtime import heartbeat_gateway_continuation
+
+                while True:
+                    await asyncio.sleep(5 * 60)
+                    try:
+                        await asyncio.to_thread(
+                            heartbeat_gateway_continuation,
+                            _zenos_continuation_id,
+                            lease_token=_zenos_continuation_token,
+                            timeout=30.0,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[%s] Zenos continuation heartbeat failed for %s: %s",
+                            self.name,
+                            _zenos_continuation_id,
+                            exc,
+                        )
+
+            _zenos_continuation_heartbeat_task = asyncio.create_task(
+                _heartbeat_zenos_continuation()
+            )
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
@@ -5155,6 +5217,7 @@ class BasePlatformAdapter(ABC):
                 event,
                 ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
             )
+            await _ack_zenos_continuation(cancelled=not processing_ok)
 
             # The active drain owns debounce state. If a queue-mode timer has
             # not fired yet, force-flush into _pending_messages here and let
@@ -5206,9 +5269,11 @@ class BasePlatformAdapter(ABC):
             if current_task is None or current_task not in self._expected_cancelled_tasks:
                 outcome = ProcessingOutcome.FAILURE
             await self._run_processing_hook("on_processing_complete", event, outcome)
+            await _ack_zenos_continuation(cancelled=True)
             raise
         except Exception as e:
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
+            await _ack_zenos_continuation(cancelled=True)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
             try:
@@ -5230,6 +5295,12 @@ class BasePlatformAdapter(ABC):
                     self.name, notify_err, exc_info=True,
                 )  # Last resort — don't let error reporting crash the handler
         finally:
+            if _zenos_continuation_heartbeat_task is not None:
+                _zenos_continuation_heartbeat_task.cancel()
+                try:
+                    await _zenos_continuation_heartbeat_task
+                except asyncio.CancelledError:
+                    pass
             # Stop typing before any deferred callback work.  Post-delivery
             # callbacks may perform platform I/O; a stuck callback must not
             # leave the typing refresh task running indefinitely.

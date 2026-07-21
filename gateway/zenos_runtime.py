@@ -1,8 +1,8 @@
-"""Small local client for Zenos Runtime model/session control.
+"""Local Hermes client for Zenos Cognitive Runtime.
 
-This module intentionally uses the existing gateway edge rather than adding a
-model tool.  `/wmodel` calls it from a worker thread so local HTTP never blocks
-the Telegram event loop.
+Model authority is session-scoped and single-model: `/model` selects the Host,
+and native Hermes workers plus any explicitly requested review cycle inherit
+that same model. Legacy multi-role payloads are accepted only for migration.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Mapping, Sequence
 
 DEFAULT_RUNTIME_URL = "http://127.0.0.1:3090"
 DEFAULT_ROUTER_URL = "http://127.0.0.1:20128"
-RUNTIME_ROLES = ("host", "worker", "boss")
+RUNTIME_ROLES = ("host",)
 DEFAULT_MIDDLEWARE_TIMEOUT = 180.0
 _USAGE_COUNTERS = {
     "inputTokens": "session_input_tokens",
@@ -148,12 +148,20 @@ def _runtime_key() -> str:
     raise RuntimeError("ZENOS_RUNTIME_API_KEY is not configured")
 
 
-def apply_host_token_budget(agent: Any, budget: Mapping[str, Any] | None) -> Dict[str, Any]:
-    """Apply one Runtime-issued Host cap without mutating the cached prompt.
+def apply_host_token_budget(
+    agent: Any,
+    budget: Mapping[str, Any] | None,
+    *,
+    enforce: bool = True,
+) -> Dict[str, Any]:
+    """Optionally apply one Runtime-issued Host cap for the current turn.
 
-    The returned state must be passed to :func:`restore_host_token_budget` at
-    the end of the turn so a cached agent never inherits another turn's cap.
+    Hermes needs multiple model iterations to discover tools, call them, read
+    their results, and continue. Gateway integrations should keep ``enforce``
+    disabled unless a deliberately strict execution cap is required.
     """
+    if not enforce:
+        return {"applied": False, "disabled": True}
     if not isinstance(budget, Mapping):
         return {"applied": False}
     max_calls = max(1, min(int(budget.get("maxCalls") or 1), 32))
@@ -190,15 +198,18 @@ def get_runtime_models(session_id: str) -> Dict[str, Any]:
 
 
 def save_runtime_models(session_id: str, roles: Dict[str, Dict[str, str]]) -> Dict[str, Any]:
-    payload: Dict[str, str] = {}
-    for role in RUNTIME_ROLES:
-        entry = roles.get(role) or {}
-        model = str(entry.get("model") or "").strip()
-        provider = str(entry.get("provider") or "").strip()
-        if not model or not provider:
-            raise RuntimeError(f"{role} model and provider are required")
-        payload[f"{role}Model"] = model
-        payload[f"{role}Provider"] = provider
+    # Compatibility adapter for stale callers: select the first usable model
+    # and write it as the single Host slot. Runtime normalizes old role payloads
+    # the same way, so no session loses its prior selection during migration.
+    entry = roles.get("host") or roles.get("worker") or roles.get("verifier") or roles.get("boss") or {}
+    model = str(entry.get("model") or "").strip()
+    provider = str(entry.get("provider") or "").strip()
+    if not model or not provider:
+        raise RuntimeError("model and provider are required")
+    payload: Dict[str, str] = {
+        "hostModel": model,
+        "hostProvider": provider,
+    }
     return _json_request(
         f"{_runtime_url()}/api/runtime/models?sessionId={urllib.parse.quote(session_id)}",
         api_key=_runtime_key(),
@@ -226,14 +237,14 @@ def list_runtime_combos() -> List[Dict[str, Any]]:
 def role_config_from_response(data: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
     config = data.get("config") if isinstance(data.get("config"), dict) else data
     configured_roles = config.get("roles") if isinstance(config, dict) else {}
-    result: Dict[str, Dict[str, str]] = {}
-    for role in RUNTIME_ROLES:
-        entry = configured_roles.get(role) if isinstance(configured_roles, dict) else {}
-        result[role] = {
-            "model": str((entry or {}).get("model") or "unknown"),
-            "provider": str((entry or {}).get("provider") or "default"),
-        }
-    return result
+    host = configured_roles.get("host") if isinstance(configured_roles, dict) else {}
+    identity = {
+        "model": str((host or {}).get("model") or "unknown"),
+        "provider": str((host or {}).get("provider") or "default"),
+    }
+    # Return legacy aliases for stale Telegram picker state, all pointing to the
+    # same authoritative Host identity. New user-facing flows use /model only.
+    return {role: dict(identity) for role in ("host", "worker", "verifier", "boss")}
 
 
 def middleware_settings(config: Mapping[str, Any] | None) -> Dict[str, Any]:
@@ -273,7 +284,34 @@ def middleware_settings(config: Mapping[str, Any] | None) -> Dict[str, Any]:
             section.get("disable_streaming_when_verified", True)
         ),
         "report_failures": bool(section.get("report_failures", True)),
+        "authoritative_host": bool(section.get("authoritative_host", True)),
+        # Hermes is a tool-using agent loop, not a single inference call. Runtime
+        # budgets remain useful for accounting and postflight decisions, but
+        # shrinking max_iterations or the compressor threshold makes the Host
+        # forget tools/context before it can finish the turn. These execution
+        # caps are therefore opt-in.
+        "enforce_host_token_budget": bool(section.get("enforce_host_token_budget", False)),
+        "enforce_host_working_set_limit": bool(section.get("enforce_host_working_set_limit", False)),
     }
+
+
+def authoritative_host_override(
+    preflight: Mapping[str, Any] | None,
+    settings: Mapping[str, Any] | None,
+) -> Dict[str, str] | None:
+    """Return the Runtime-selected Host when Runtime owns Host authority."""
+    if not isinstance(preflight, Mapping) or not isinstance(settings, Mapping):
+        return None
+    if not settings.get("authoritative_host", True):
+        return None
+    raw = preflight.get("hostOverride")
+    if not isinstance(raw, Mapping):
+        return None
+    model = str(raw.get("model") or "").strip()
+    provider = str(raw.get("provider") or "").strip()
+    if not model or not provider:
+        return None
+    return {"model": model, "provider": provider}
 
 
 def _content_text(content: Any) -> str:
@@ -392,13 +430,20 @@ def handoff_messages(
     return (head + tail)[-max_messages:]
 
 
-def apply_host_working_set_limit(agent: Any, soft_limit_tokens: int) -> Dict[str, Any]:
-    """Apply one reversible Host working-set limit for the current turn only.
+def apply_host_working_set_limit(
+    agent: Any,
+    soft_limit_tokens: int,
+    *,
+    enforce: bool = True,
+) -> Dict[str, Any]:
+    """Optionally apply a reversible Host working-set limit for one turn.
 
-    Cached agents are reused across gateway turns. Every compressor field changed
-    here is therefore captured and restored in ``finally``; otherwise one cheap
-    chat turn can permanently trap a later coding turn behind a tiny threshold.
+    Native Hermes compression remains authoritative by default. Lowering its
+    threshold on routine turns can discard conversational and tool context far
+    earlier than the configured model window.
     """
+    if not enforce:
+        return {"applied": False, "disabled": True, "previous": 0, "current": 0}
     compressor = getattr(agent, "context_compressor", None)
     if compressor is None:
         return {"applied": False, "previous": 0, "current": 0}
@@ -486,7 +531,9 @@ def infer_turn_context(
     )
     log_terms = ("log", "journalctl", "traceback", "stack trace", "stdout", "stderr")
     verification_terms = (
-        "verify", "pastikan", "cek bener", "are you sure", "yakin", "test", "uji",
+        "verify", "verification", "verifikasi", "diverifikasi", "validasi", "validate",
+        "pastikan", "cek bener", "cek dulu", "cek live", "live check", "are you sure",
+        "yakin", "test", "uji", "buktikan",
     )
     boss_request_terms = (
         "tanya agent boss", "tanya boss", "panggil agent boss", "panggil boss",
@@ -496,7 +543,8 @@ def infer_turn_context(
     )
     fresh_terms = (
         "latest", "terbaru", "hari ini", "sekarang", "current", "news", "harga",
-        "weather", "jadwal", "score", "status live",
+        "weather", "jadwal", "score", "status live", "cek live", "live check",
+        "yang live", "secara live", "real-time", "real time",
     )
     execute_terms = (
         "jalankan", "run ", "deploy", "restart", "push", "commit", "hapus",
@@ -612,14 +660,25 @@ def resolve_workspace_root(
     return str(repositories[0]) if len(repositories) == 1 else ""
 
 
-def workspace_root_from_text(text: str, *, allowed_parent: str = "/root/openclaw-projects") -> str:
-    """Extract a repository path from bounded tool evidence."""
+def workspace_root_from_text(text: str, *, allowed_parent: str = "/srv/etla/workspaces") -> str:
+    """Extract and normalize a repository path from bounded tool evidence."""
     raw = str(text or "")
     parent = Path(allowed_parent).expanduser().resolve()
-    pattern = re.compile(r"(?:/root/openclaw-projects|/workspace)/[A-Za-z0-9._-]+")
+    aliases = tuple(dict.fromkeys((
+        f"{str(parent).rstrip('/')}/",
+        "/srv/etla/workspaces/",
+        "/root/openclaw-projects/",
+        "/workspace/",
+    )))
+    prefix_pattern = "|".join(re.escape(prefix.rstrip("/")) for prefix in aliases)
+    pattern = re.compile(rf"(?:{prefix_pattern})/[A-Za-z0-9._-]+")
     for match in pattern.finditer(raw):
+        matched = match.group(0)
+        relative = next((matched[len(prefix):] for prefix in aliases if matched.startswith(prefix)), "")
+        if not relative:
+            continue
         try:
-            candidate = Path(match.group(0)).expanduser().resolve()
+            candidate = (parent / relative).resolve()
             candidate.relative_to(parent)
         except Exception:
             continue
@@ -763,6 +822,90 @@ def internal_continuation_prompt(postflight: Mapping[str, Any] | None) -> str:
     return prompt[:24_000]
 
 
+def internal_continuation_id(postflight: Mapping[str, Any] | None) -> str:
+    if not isinstance(postflight, Mapping):
+        return ""
+    continuation = postflight.get("continuation")
+    if not isinstance(continuation, Mapping) or continuation.get("required") is not True:
+        return ""
+    return str(continuation.get("continuationId") or "").strip()[:220]
+
+
+def internal_continuation_token(postflight: Mapping[str, Any] | None) -> str:
+    if not isinstance(postflight, Mapping):
+        return ""
+    continuation = postflight.get("continuation")
+    if not isinstance(continuation, Mapping) or continuation.get("required") is not True:
+        return ""
+    return str(continuation.get("leaseToken") or "").strip()[:500]
+
+
+def claim_gateway_continuation(
+    session_id: str,
+    *,
+    recover_leased_before: str = "",
+    lease_owner: str = "hermes-gateway",
+    base_url: str = "",
+    timeout: float = 30.0,
+) -> Dict[str, Any]:
+    query = {
+        "sessionId": session_id,
+        "leaseOwner": str(lease_owner or "hermes-gateway")[:220],
+    }
+    if recover_leased_before:
+        query["recoverLeasedBefore"] = recover_leased_before
+    return _json_request(
+        f"{_runtime_url(base_url)}/api/runtime/gateway/continuation?{urllib.parse.urlencode(query)}",
+        api_key=_runtime_key(),
+        timeout=timeout,
+    )
+
+
+def complete_gateway_continuation(
+    continuation_id: str,
+    *,
+    lease_token: str,
+    cancelled: bool = False,
+    base_url: str = "",
+    timeout: float = 30.0,
+) -> Dict[str, Any]:
+    if not continuation_id or not lease_token:
+        return {"ok": False, "skipped": True}
+    return _json_request(
+        f"{_runtime_url(base_url)}/api/runtime/gateway/continuation",
+        api_key=_runtime_key(),
+        method="POST",
+        body={
+            "continuationId": continuation_id,
+            "leaseToken": lease_token,
+            "action": "cancel" if cancelled else "complete",
+        },
+        timeout=timeout,
+    )
+
+
+def heartbeat_gateway_continuation(
+    continuation_id: str,
+    *,
+    lease_token: str,
+    base_url: str = "",
+    timeout: float = 30.0,
+) -> Dict[str, Any]:
+    if not continuation_id or not lease_token:
+        return {"ok": False, "skipped": True}
+    return _json_request(
+        f"{_runtime_url(base_url)}/api/runtime/gateway/continuation",
+        api_key=_runtime_key(),
+        method="POST",
+        body={
+            "continuationId": continuation_id,
+            "leaseToken": lease_token,
+            "action": "heartbeat",
+        },
+        timeout=timeout,
+    )
+
+
 def gateway_postflight(
     payload: Mapping[str, Any],
     *,
@@ -778,20 +921,202 @@ def gateway_postflight(
     )
 
 
-def bounded_tool_summary(tools: Any, max_chars: int = 20_000) -> str:
-    """Summarize this turn's tool evidence without forwarding raw long output."""
-    if not isinstance(tools, list):
+_VALIDATION_PATTERN = re.compile(
+    r"\b(?:test|tests|pytest|vitest|jest|lint|eslint|typecheck|tsc|build|compile|py_compile|syntax|smoke)\b",
+    re.I,
+)
+_MUTATING_TOOL_PATTERN = re.compile(
+    r"\b(?:patch|apply_patch|edit|write|create_file|delete_file|replace|str_replace)\b",
+    re.I,
+)
+
+
+def _json_object(value: Any) -> Dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    text = _content_text(value).strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        return {}
+    return dict(parsed) if isinstance(parsed, Mapping) else {}
+
+
+def _integer_field(record: Mapping[str, Any], *names: str) -> int | None:
+    for name in names:
+        value = record.get(name)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and re.fullmatch(r"-?\d+", value.strip()):
+            return int(value.strip())
+    return None
+
+
+def _string_list(value: Any, limit: int = 200) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    result: List[str] = []
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            result.append(item.strip()[:4096])
+        elif isinstance(item, Mapping):
+            path = str(item.get("path") or item.get("file") or "").strip()
+            if path:
+                result.append(path[:4096])
+        if len(result) >= limit:
+            break
+    return list(dict.fromkeys(result))
+
+
+def _workspace_revision(state: Mapping[str, Any] | None) -> str:
+    if not isinstance(state, Mapping):
         return ""
-    lines: List[str] = []
-    for item in tools[-40:]:
-        if isinstance(item, Mapping):
-            name = str(item.get("name") or item.get("tool") or "tool")
-            status = str(item.get("status") or "completed")
-            result = item.get("result")
-            preview = _content_text(result).replace("\n", " ").strip()[:400]
-            lines.append(f"{name}: {status}{f' — {preview}' if preview else ''}")
-        else:
-            lines.append(str(item)[:500])
+    return str(state.get("dirtyDiffSha256") or state.get("dirty_diff_sha256") or "").strip()
+
+
+def structured_execution_receipts(
+    messages: Any,
+    *,
+    history_offset: int = 0,
+    workspace_before: Mapping[str, Any] | None = None,
+    workspace_after: Mapping[str, Any] | None = None,
+    max_receipts: int = 200,
+) -> List[Dict[str, Any]]:
+    """Compile actual tool-call/result messages into deterministic receipts.
+
+    Tool definitions are deliberately ignored. Runtime completion evidence must
+    come from assistant ``tool_calls`` paired with ``role=tool`` results.
+    """
+    if not isinstance(messages, list):
+        messages = []
+    bounded_offset = max(0, min(int(history_offset or 0), len(messages)))
+    turn_messages = messages[bounded_offset:] if bounded_offset else messages[-240:]
+    calls: Dict[str, Dict[str, Any]] = {}
+    receipts: List[Dict[str, Any]] = []
+
+    for message in turn_messages:
+        if not isinstance(message, Mapping) or message.get("role") != "assistant":
+            continue
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for call in tool_calls:
+            if not isinstance(call, Mapping):
+                continue
+            function = call.get("function") if isinstance(call.get("function"), Mapping) else {}
+            call_id = str(call.get("id") or "").strip()
+            if not call_id:
+                continue
+            arguments = _json_object(function.get("arguments"))
+            calls[call_id] = {
+                "name": str(function.get("name") or call.get("name") or "tool").strip() or "tool",
+                "arguments": arguments,
+            }
+
+    for message in turn_messages:
+        if not isinstance(message, Mapping) or message.get("role") != "tool":
+            continue
+        call_id = str(message.get("tool_call_id") or "").strip()
+        call = calls.get(call_id, {})
+        name = str(message.get("name") or call.get("name") or "tool").strip() or "tool"
+        arguments = call.get("arguments") if isinstance(call.get("arguments"), Mapping) else {}
+        content = _content_text(message.get("content"))
+        result = _json_object(message.get("content"))
+        nested = result.get("result") if isinstance(result.get("result"), Mapping) else {}
+        merged = {**result, **nested}
+        exit_code = _integer_field(merged, "exit_code", "exitCode", "returncode", "return_code", "code")
+        explicit_error = merged.get("error") or merged.get("errors")
+        raw_status = str(merged.get("status") or merged.get("outcome") or "").strip().lower()
+        failed = bool(explicit_error) or (exit_code is not None and exit_code != 0) or raw_status in {
+            "failed", "failure", "error", "blocked", "cancelled", "timeout", "timed_out",
+        }
+        passed = (exit_code == 0) or raw_status in {"passed", "success", "succeeded", "completed", "done", "ok"}
+        status = "failed" if failed else "passed" if passed else "unknown"
+        command = str(
+            arguments.get("command") or arguments.get("cmd")
+            or merged.get("command") or merged.get("cmd") or ""
+        ).strip()[:4000]
+        validation_text = f"{name}\n{command}\n{content[:1200]}"
+        validation_kind = ""
+        if _VALIDATION_PATTERN.search(validation_text):
+            lowered = validation_text.lower()
+            validation_kind = next((kind for kind in (
+                "typecheck", "lint", "build", "compile", "syntax", "smoke", "test"
+            ) if kind in lowered), "other")
+        mutating = bool(_MUTATING_TOOL_PATTERN.search(name))
+        changed_files = _string_list(
+            merged.get("changed_files") or merged.get("changedFiles") or merged.get("files_changed")
+        )
+        artifact_ids = _string_list(merged.get("artifact_ids") or merged.get("artifactIds"), 100)
+        kind = "validation" if validation_kind else "workspace" if mutating or changed_files else "artifact" if artifact_ids else "tool"
+        summary = re.sub(r"\s+", " ", content).strip()[:4000]
+        receipt_basis = json.dumps({
+            "call_id": call_id,
+            "name": name,
+            "command": command,
+            "exit_code": exit_code,
+            "status": status,
+            "summary": summary,
+        }, sort_keys=True, ensure_ascii=False)
+        receipt = {
+            "receiptId": f"hermes-tool-{hashlib.sha256(receipt_basis.encode('utf-8')).hexdigest()[:32]}",
+            "kind": kind,
+            "tool": name[:200],
+            "status": status,
+            "summary": summary,
+            "changedFiles": changed_files,
+            "artifactIds": artifact_ids,
+            "metadata": {"mutating": mutating, "toolCallId": call_id[:500]},
+        }
+        if command:
+            receipt["command"] = command
+        if exit_code is not None:
+            receipt["exitCode"] = exit_code
+        if validation_kind:
+            receipt["validationKind"] = validation_kind
+        receipts.append(receipt)
+        if len(receipts) >= max_receipts:
+            break
+
+    before_revision = _workspace_revision(workspace_before)
+    after_revision = _workspace_revision(workspace_after)
+    if after_revision and before_revision != after_revision and len(receipts) < max_receipts:
+        after_files = _string_list((workspace_after or {}).get("changedFiles"))
+        basis = f"{before_revision}\n{after_revision}\n" + "\n".join(after_files)
+        receipts.append({
+            "receiptId": f"hermes-workspace-{hashlib.sha256(basis.encode('utf-8')).hexdigest()[:32]}",
+            "kind": "workspace",
+            "status": "passed",
+            "summary": "Hermes workspace snapshot changed during this Host cycle.",
+            "changedFiles": after_files,
+            "artifactIds": [],
+            "workspaceRevisionBefore": before_revision or None,
+            "workspaceRevisionAfter": after_revision,
+            "metadata": {"mutating": True},
+        })
+    return receipts
+
+
+def bounded_tool_summary(messages: Any, max_chars: int = 20_000, *, history_offset: int = 0) -> str:
+    """Summarize actual structured execution receipts, never tool schemas."""
+    receipts = structured_execution_receipts(messages, history_offset=history_offset)
+    lines = []
+    for receipt in receipts[-40:]:
+        exit_suffix = (
+            f" exit={receipt.get('exitCode')}"
+            if receipt.get("exitCode") is not None
+            else ""
+        )
+        summary_suffix = f" — {receipt.get('summary')}" if receipt.get("summary") else ""
+        line = (
+            f"{receipt.get('tool') or receipt.get('kind')}: {receipt.get('status')}"
+            f"{exit_suffix}{summary_suffix}"
+        )
+        lines.append(line[:700])
     return "\n".join(lines)[-max_chars:]
 
 
