@@ -19,6 +19,7 @@ from gateway.zenos_runtime import (
     omit_none_values,
     resolve_workspace_root,
     restore_host_working_set_limit,
+    runtime_failure_may_fail_open,
     runtime_session_id,
     structured_execution_receipts,
     usage_delta,
@@ -218,6 +219,8 @@ def test_middleware_settings_are_fail_open_and_bounded():
 
     assert settings["enabled"] is True
     assert settings["fail_open"] is True
+    assert settings["fail_closed_mutations"] is True
+    assert settings["continuity_packet_v2"] is True
     assert settings["timeout_seconds"] == 600.0
     assert settings["max_history_chars"] == 120000
     assert settings["context_soft_limit_tokens"] == 64000
@@ -227,6 +230,39 @@ def test_middleware_settings_are_fail_open_and_bounded():
     assert settings["authoritative_host"] is True
     assert settings["enforce_host_token_budget"] is False
     assert settings["enforce_host_working_set_limit"] is False
+
+
+def test_runtime_failure_only_fails_open_for_read_only_low_risk_work():
+    settings = {
+        "fail_open": True,
+        "fail_closed_mutations": True,
+    }
+
+    assert runtime_failure_may_fail_open(
+        settings,
+        message="Explain how the Runtime router works.",
+        routing_hints={"intent": "explain", "hasCodeChangeIntent": False},
+    ) is True
+    assert runtime_failure_may_fail_open(
+        settings,
+        message="Fix the auth bug and run tests.",
+        routing_hints={"intent": "mutate", "hasCodeChangeIntent": True},
+    ) is False
+    assert runtime_failure_may_fail_open(
+        settings,
+        message="Deploy this release.",
+        routing_hints={"intent": "execute", "hasCodeChangeIntent": False},
+    ) is False
+    assert runtime_failure_may_fail_open(
+        settings,
+        message="Review the proposed patch.",
+        routing_hints={"intent": "analyze", "hasCodeChangeIntent": False},
+        preflight={"decision": {"taskType": "coding_change"}},
+    ) is False
+    assert runtime_failure_may_fail_open(
+        {"fail_open": True, "fail_closed_mutations": False},
+        message="Deploy this release.",
+    ) is True
 
 
 def test_runtime_host_override_is_applied_only_when_authority_is_enabled():

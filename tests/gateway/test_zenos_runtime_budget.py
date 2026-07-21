@@ -3,6 +3,19 @@ from types import SimpleNamespace
 from gateway.zenos_runtime import apply_host_token_budget, restore_host_token_budget
 
 
+def test_host_budget_can_be_disabled_without_shrinking_the_tool_loop():
+    agent = SimpleNamespace(max_iterations=90, max_tokens=None)
+    state = apply_host_token_budget(
+        agent,
+        {"maxCalls": 1, "maxOutputTokens": 1600},
+        enforce=False,
+    )
+
+    assert state == {"applied": False, "disabled": True}
+    assert agent.max_iterations == 90
+    assert agent.max_tokens is None
+
+
 def test_host_budget_is_bounded_for_one_turn_and_then_restored():
     agent = SimpleNamespace(max_iterations=90, max_tokens=None)
     state = apply_host_token_budget(

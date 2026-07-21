@@ -259,6 +259,8 @@ def middleware_settings(config: Mapping[str, Any] | None) -> Dict[str, Any]:
         "enabled": bool(section.get("enabled", False)),
         "url": str(section.get("url") or DEFAULT_RUNTIME_URL).rstrip("/"),
         "fail_open": bool(section.get("fail_open", True)),
+        "fail_closed_mutations": bool(section.get("fail_closed_mutations", True)),
+        "continuity_packet_v2": bool(section.get("continuity_packet_v2", True)),
         "receipt": str(section.get("receipt") or "concise").strip().lower(),
         "timeout_seconds": min(
             max(float(section.get("timeout_seconds") or DEFAULT_MIDDLEWARE_TIMEOUT), 10.0),
@@ -293,6 +295,47 @@ def middleware_settings(config: Mapping[str, Any] | None) -> Dict[str, Any]:
         "enforce_host_token_budget": bool(section.get("enforce_host_token_budget", False)),
         "enforce_host_working_set_limit": bool(section.get("enforce_host_working_set_limit", False)),
     }
+
+
+def runtime_failure_may_fail_open(
+    settings: Mapping[str, Any] | None,
+    *,
+    message: str = "",
+    routing_hints: Mapping[str, Any] | None = None,
+    preflight: Mapping[str, Any] | None = None,
+) -> bool:
+    """Return whether Runtime failure may release an unverified Host response.
+
+    Read-only low-risk chat may remain available during a sidecar outage. Code
+    mutation, deploy/destructive work, and security/secret boundaries pause or
+    fail closed by default so a missing Runtime cannot silently bypass policy,
+    deterministic validation, or approval checks.
+    """
+    if not isinstance(settings, Mapping) or not bool(settings.get("fail_open", True)):
+        return False
+    if not bool(settings.get("fail_closed_mutations", True)):
+        return True
+
+    hints = routing_hints if isinstance(routing_hints, Mapping) else {}
+    decision = preflight.get("decision") if isinstance(preflight, Mapping) else {}
+    task_type = str((decision or {}).get("taskType") or "").strip()
+    if task_type in {
+        "coding_change",
+        "security_or_secret",
+        "deploy_or_destructive_action",
+    }:
+        return False
+    if bool(hints.get("hasCodeChangeIntent")) or str(hints.get("intent") or "") == "mutate":
+        return False
+    text = str(message or "")
+    if re.search(
+        r"\b(?:deploy|restart|push|commit|install|delete|hapus|wipe|destroy|rotate\s+key|"
+        r"secret|credential|private\s+key|api\s*key|token)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return False
+    return True
 
 
 def authoritative_host_override(
@@ -428,6 +471,349 @@ def handoff_messages(
         used += size
     tail.reverse()
     return (head + tail)[-max_messages:]
+
+
+_CONTINUITY_GOAL_RE = re.compile(
+    r"\b(?:buat|bikin|fix|perbaiki|implement|upgrade|audit|deploy|ubah|tambahkan|hapus|selesaikan|kerjakan|build|debug|goal|tujuan|pengen|mau)\b",
+    re.IGNORECASE,
+)
+_CONTINUITY_DECISION_RE = re.compile(
+    r"\b(?:decision|decided|final|approved|confirmed|pilih|pakai|gunakan|diputuskan|keputusan)\b",
+    re.IGNORECASE,
+)
+_CONTINUITY_CONSTRAINT_RE = re.compile(
+    r"\b(?:must|must not|do not|never|always|jangan|harus|wajib|tanpa|only|hanya|acceptance criteria)\b",
+    re.IGNORECASE,
+)
+_CONTINUITY_PATCH_RE = re.compile(
+    r"\b(?:patch|patched|edit|edited|changed|modified|write|replace|mutation|diff|commit)\b",
+    re.IGNORECASE,
+)
+_CONTINUITY_VALIDATION_RE = re.compile(
+    r"\b(?:test|tested|typecheck|lint|build|compile|validation|validate|verified|pass(?:ed)?|fail(?:ed)?)\b",
+    re.IGNORECASE,
+)
+_CONTINUITY_BLOCKER_RE = re.compile(
+    r"\b(?:blocker|blocked|error|failed|failure|timeout|denied|broken|invalid|regression|crash|ngadat|gagal|pending approval)\b",
+    re.IGNORECASE,
+)
+_CONTINUITY_PENDING_RE = re.compile(
+    r"\b(?:todo|pending|next|remaining|lanjut|belum|unfinished|retry|approval|required|needs? to)\b",
+    re.IGNORECASE,
+)
+_CONTINUITY_PATH_RE = re.compile(
+    r"(?:/srv/etla/workspaces/|/usr/local/lib/hermes-agent/|app/|gateway/|tests/|scripts/)[A-Za-z0-9_./-]+"
+)
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def compute_continuity_packet_hash(packet: Mapping[str, Any]) -> str:
+    hashable = {
+        key: value
+        for key, value in packet.items()
+        if key != "contentHash" and value is not None
+    }
+    return hashlib.sha256(_canonical_json(hashable).encode("utf-8")).hexdigest()
+
+
+def _stable_occurred_at(message: Mapping[str, Any]) -> str:
+    for key in ("occurred_at", "created_at", "timestamp", "time"):
+        value = str(message.get(key) or "").strip()
+        if not value:
+            continue
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        except ValueError:
+            continue
+    # A stable fallback is required so an identical retry produces the same
+    # packet hash and therefore the same Memory checkpoint.
+    return "1970-01-01T00:00:00Z"
+
+
+def _continuity_entry(message: Mapping[str, Any], index: int) -> Dict[str, Any] | None:
+    role = str(message.get("role") or "").strip().lower()
+    if role not in {"user", "assistant", "tool", "system"}:
+        return None
+    text = _content_text(message.get("content")).strip()
+    if role == "assistant" and message.get("tool_calls"):
+        names: List[str] = []
+        calls = message.get("tool_calls")
+        if isinstance(calls, list):
+            for call in calls[:16]:
+                if not isinstance(call, Mapping):
+                    continue
+                function = call.get("function")
+                if isinstance(function, Mapping):
+                    name = str(function.get("name") or "").strip()
+                    if name:
+                        names.append(name)
+        if names:
+            text = f"{text}\n[tool calls: {', '.join(names)}]".strip()
+    name = str(message.get("name") or message.get("tool_name") or "").strip()
+    if role == "tool":
+        text = f"{name or 'tool'}: {text}" if text else f"{name or 'tool'}: completed"
+    if not text:
+        return None
+    source_hash = hashlib.sha256(f"{role}\n{text}".encode("utf-8")).hexdigest()
+    provided_id = str(message.get("message_id") or message.get("id") or "").strip()
+    message_id = provided_id[:500] if provided_id else f"m{index}:{role}:{source_hash[:16]}"
+    return {
+        "index": index,
+        "role": role,
+        "content": text,
+        "name": name[:200],
+        "tool_call_id": str(message.get("tool_call_id") or "").strip()[:500],
+        "message_id": message_id,
+        "source_hash": source_hash,
+        "occurred_at": _stable_occurred_at(message),
+    }
+
+
+def _bounded_packet_messages(
+    entries: Sequence[Mapping[str, Any]],
+    *,
+    max_chars: int,
+    direction: str,
+    limit: int,
+) -> List[Dict[str, str]]:
+    source = list(entries) if direction == "head" else list(reversed(entries))
+    kept: List[Dict[str, str]] = []
+    used = 0
+    for entry in source:
+        if len(kept) >= limit:
+            break
+        remaining = max_chars - used
+        if remaining <= 64:
+            break
+        content = str(entry.get("content") or "")[: min(24_000, max(64, remaining - 64))]
+        item: Dict[str, str] = {
+            "role": str(entry.get("role") or "system"),
+            "content": content,
+            "message_id": str(entry.get("message_id") or "")[:500],
+        }
+        name = str(entry.get("name") or "").strip()
+        tool_call_id = str(entry.get("tool_call_id") or "").strip()
+        if name:
+            item["name"] = name[:200]
+        if tool_call_id:
+            item["tool_call_id"] = tool_call_id[:500]
+        size = len(_canonical_json(item))
+        if size > remaining and kept:
+            continue
+        kept.append(item)
+        used += min(size, remaining)
+    return kept if direction == "head" else list(reversed(kept))
+
+
+def _milestone_kind(entry: Mapping[str, Any]) -> str | None:
+    text = str(entry.get("content") or "")
+    role = str(entry.get("role") or "")
+    if _CONTINUITY_BLOCKER_RE.search(text):
+        return "blocker"
+    if _CONTINUITY_VALIDATION_RE.search(text):
+        return "validation"
+    if _CONTINUITY_PATCH_RE.search(text):
+        return "patch"
+    if role == "tool":
+        return "tool_result"
+    if _CONTINUITY_DECISION_RE.search(text):
+        return "decision"
+    if _CONTINUITY_CONSTRAINT_RE.search(text):
+        return "constraint"
+    if role == "user" and _CONTINUITY_GOAL_RE.search(text):
+        return "goal"
+    return None
+
+
+def build_continuity_packet(
+    history: Sequence[Mapping[str, Any]] | None,
+    *,
+    session_id: str,
+    turn_id: str,
+    estimated_tokens: int,
+    max_chars: int = 240_000,
+    max_messages: int = 300,
+    previous_checkpoint_id: str = "",
+) -> Dict[str, Any] | None:
+    """Compile an evidence-addressed packet for Runtime-owned continuity.
+
+    The packet is deterministic for identical input. It keeps meaningful head
+    instructions, ranked milestones from the full transcript, active tool
+    evidence, unfinished work, and a recent tail under independent budgets.
+    """
+    if not history:
+        return None
+    entries = [
+        entry
+        for index, message in enumerate(history)
+        if isinstance(message, Mapping)
+        for entry in [_continuity_entry(message, index)]
+        if entry is not None
+    ]
+    if not entries:
+        return None
+
+    total_chars = min(max(int(max_chars or 240_000), 20_000), 500_000)
+    head_budget = int(total_chars * 0.12)
+    milestone_budget = int(total_chars * 0.33)
+    tool_budget = int(total_chars * 0.20)
+    tail_budget = total_chars - head_budget - milestone_budget - tool_budget
+
+    head_candidates = [
+        entry for entry in entries[:40]
+        if entry["role"] in {"system", "user"}
+        and (
+            _CONTINUITY_GOAL_RE.search(entry["content"])
+            or _CONTINUITY_DECISION_RE.search(entry["content"])
+            or _CONTINUITY_CONSTRAINT_RE.search(entry["content"])
+        )
+    ]
+    if not head_candidates:
+        head_candidates = [entry for entry in entries[:12] if entry["role"] in {"system", "user"}]
+    head = _bounded_packet_messages(
+        head_candidates[:8],
+        max_chars=head_budget,
+        direction="head",
+        limit=min(8, max_messages),
+    )
+
+    ranked_milestones: List[Dict[str, Any]] = []
+    for entry in entries:
+        kind = _milestone_kind(entry)
+        if not kind:
+            continue
+        priority = {
+            "blocker": 7,
+            "validation": 6,
+            "patch": 5,
+            "tool_result": 4,
+            "decision": 3,
+            "constraint": 2,
+            "goal": 1,
+        }[kind]
+        ranked_milestones.append({
+            "kind": kind,
+            "text": str(entry["content"])[:8_000],
+            "sourceMessageIds": [str(entry["message_id"])],
+            "sourceHash": str(entry["source_hash"]),
+            "occurredAt": str(entry["occurred_at"]),
+            "_index": int(entry["index"]),
+            "_priority": priority,
+        })
+    ranked_milestones.sort(key=lambda item: (item["_priority"], item["_index"]), reverse=True)
+    selected_milestones: List[Dict[str, Any]] = []
+    milestone_used = 0
+    for item in ranked_milestones:
+        public_item = {key: value for key, value in item.items() if not key.startswith("_")}
+        size = len(_canonical_json(public_item))
+        if len(selected_milestones) >= 100 or milestone_used + size > milestone_budget:
+            continue
+        selected_milestones.append(public_item)
+        milestone_used += size
+    selected_milestones.sort(
+        key=lambda item: next(
+            (entry["index"] for entry in entries if entry["source_hash"] == item["sourceHash"]),
+            0,
+        )
+    )
+
+    active_tool_state: List[Dict[str, Any]] = []
+    tool_used = 0
+    for entry in reversed(entries):
+        if entry["role"] != "tool":
+            continue
+        text = str(entry["content"])
+        status = (
+            "blocked" if re.search(r"\b(?:blocked|denied)\b", text, re.IGNORECASE)
+            else "failed" if _CONTINUITY_BLOCKER_RE.search(text)
+            else "running" if re.search(r"\b(?:running|started|in progress)\b", text, re.IGNORECASE)
+            else "passed"
+        )
+        item = {
+            "id": str(entry["message_id"]),
+            "tool": str(entry.get("name") or "tool")[:200],
+            "status": status,
+            "summary": text[:8_000],
+            "changedFiles": list(dict.fromkeys(_CONTINUITY_PATH_RE.findall(text)))[:200],
+            "artifactIds": [],
+            "sourceMessageIds": [str(entry["message_id"])],
+            "sourceHash": str(entry["source_hash"]),
+            "occurredAt": str(entry["occurred_at"]),
+        }
+        size = len(_canonical_json(item))
+        if len(active_tool_state) >= 80 or tool_used + size > tool_budget:
+            continue
+        active_tool_state.append(item)
+        tool_used += size
+    active_tool_state.reverse()
+
+    open_work: List[Dict[str, Any]] = []
+    for entry in reversed(entries):
+        text = str(entry["content"])
+        if not (_CONTINUITY_PENDING_RE.search(text) or _CONTINUITY_BLOCKER_RE.search(text)):
+            continue
+        lowered = text.lower()
+        kind = (
+            "approval" if "approval" in lowered
+            else "validate" if _CONTINUITY_VALIDATION_RE.search(text)
+            else "patch" if _CONTINUITY_PATCH_RE.search(text)
+            else "other"
+        )
+        item = {
+            "id": f"work:{entry['message_id']}",
+            "kind": kind,
+            "text": text[:8_000],
+            "status": "blocked" if _CONTINUITY_BLOCKER_RE.search(text) else "retry_pending" if "retry" in lowered else "queued",
+            "acceptanceCriteria": [
+                line.strip(" -")[:2_000]
+                for line in text.splitlines()
+                if re.search(r"acceptance|criteria|must|harus|wajib", line, re.IGNORECASE)
+            ][:20],
+            "blockers": [text[:2_000]] if _CONTINUITY_BLOCKER_RE.search(text) else [],
+            "sourceMessageIds": [str(entry["message_id"])],
+            "sourceHash": str(entry["source_hash"]),
+        }
+        if item not in open_work:
+            open_work.append(item)
+        if len(open_work) >= 80:
+            break
+    open_work.reverse()
+
+    tail_limit = min(160, max(20, int(max_messages or 300) - len(head)))
+    recent_tail = _bounded_packet_messages(
+        entries,
+        max_chars=tail_budget,
+        direction="tail",
+        limit=tail_limit,
+    )
+    source_cursor = f"msg:{len(entries)}:{entries[-1]['source_hash'][:24]}"
+    packet: Dict[str, Any] = {
+        "version": "continuity-v2",
+        "sessionId": str(session_id)[:220],
+        "turnId": str(turn_id)[:220],
+        "sourceCursor": source_cursor,
+        "estimatedTokens": max(0, min(int(estimated_tokens or 0), 10_000_000)),
+        "head": head,
+        "milestones": selected_milestones,
+        "recentTail": recent_tail,
+        "activeToolState": active_tool_state,
+        "openWork": open_work,
+    }
+    if previous_checkpoint_id:
+        packet["previousCheckpointId"] = str(previous_checkpoint_id)[:500]
+    packet["contentHash"] = compute_continuity_packet_hash(packet)
+    return packet
 
 
 def apply_host_working_set_limit(

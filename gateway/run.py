@@ -17051,10 +17051,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _zenos_host_provider = ""
         _zenos_workspace_root = ""
         _zenos_workspace_state_before = None
+        _zenos_routing_hints = {}
         _zenos_original_message = message
         try:
             from gateway.zenos_runtime import (
                 authoritative_host_override as _zenos_authoritative_host_override,
+                build_continuity_packet as _zenos_build_continuity_packet,
                 compact_history as _zenos_compact_history,
                 gateway_preflight as _zenos_gateway_preflight,
                 handoff_messages as _zenos_handoff_messages,
@@ -17062,6 +17064,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 middleware_settings as _zenos_middleware_settings,
                 new_turn_id as _zenos_new_turn_id,
                 resolve_workspace_root as _zenos_resolve_workspace_root,
+                runtime_failure_may_fail_open as _zenos_runtime_failure_may_fail_open,
                 runtime_session_id as _zenos_runtime_session_id,
                 workspace_state_snapshot as _zenos_workspace_state_snapshot,
             )
@@ -17102,15 +17105,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     history=history,
                     workspace_root=_workspace_root,
                 )
+                _zenos_routing_hints = _routing_hints
                 _handoff_messages = []
+                _continuity_packet = None
                 if int(_routing_hints.get("estimatedContextTokens") or 0) >= int(
                     _zenos_settings.get("context_soft_limit_tokens") or 160_000
                 ):
+                    _handoff_chars = int(_zenos_settings.get("handoff_history_chars") or 240_000)
+                    _handoff_message_limit = int(_zenos_settings.get("handoff_max_messages") or 300)
                     _handoff_messages = _zenos_handoff_messages(
                         history,
-                        max_chars=int(_zenos_settings.get("handoff_history_chars") or 240_000),
-                        max_messages=int(_zenos_settings.get("handoff_max_messages") or 300),
+                        max_chars=_handoff_chars,
+                        max_messages=_handoff_message_limit,
                     )
+                    _checkpoint_cache = getattr(self, "_zenos_memory_checkpoints", None)
+                    if not isinstance(_checkpoint_cache, dict):
+                        _checkpoint_cache = {}
+                        setattr(self, "_zenos_memory_checkpoints", _checkpoint_cache)
+                    if bool(_zenos_settings.get("continuity_packet_v2", True)):
+                        _continuity_packet = _zenos_build_continuity_packet(
+                            history,
+                            session_id=_runtime_id,
+                            turn_id=_turn_id,
+                            estimated_tokens=int(_routing_hints.get("estimatedContextTokens") or 0),
+                            max_chars=_handoff_chars,
+                            max_messages=_handoff_message_limit,
+                            previous_checkpoint_id=str(_checkpoint_cache.get(_runtime_id) or ""),
+                        )
                 _preflight_payload = {
                     "request": message,
                     "sessionId": _runtime_id,
@@ -17125,6 +17146,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         int(_zenos_settings.get("max_history_chars") or 0),
                     ),
                     "handoffMessages": _handoff_messages,
+                    "continuityPacket": _continuity_packet,
                     "workspaceRoot": _workspace_root or None,
                     "workspaceState": _zenos_workspace_state_before,
                     **_routing_hints,
@@ -17140,6 +17162,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     base_url=str(_zenos_settings.get("url") or ""),
                     timeout=float(_zenos_settings.get("timeout_seconds") or 180),
                 )
+                _memory_checkpoint_id = str((_zenos_turn or {}).get("memoryCheckpointId") or "").strip()
+                if _memory_checkpoint_id:
+                    _checkpoint_cache = getattr(self, "_zenos_memory_checkpoints", None)
+                    if not isinstance(_checkpoint_cache, dict):
+                        _checkpoint_cache = {}
+                        setattr(self, "_zenos_memory_checkpoints", _checkpoint_cache)
+                    _checkpoint_cache[_runtime_id] = _memory_checkpoint_id
                 _runtime_host_override = _zenos_authoritative_host_override(
                     _zenos_turn,
                     _zenos_settings,
@@ -17190,7 +17219,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
         except Exception as _zenos_preflight_error:
             logger.exception("Zenos native preflight failed: %s", _zenos_preflight_error)
-            if _zenos_settings and not _zenos_settings.get("fail_open", True):
+            _may_fail_open = False
+            try:
+                _may_fail_open = _zenos_runtime_failure_may_fail_open(
+                    _zenos_settings,
+                    message=_zenos_original_message,
+                    routing_hints=_zenos_routing_hints,
+                    preflight=_zenos_turn,
+                )
+            except Exception:
+                _may_fail_open = False
+            if _zenos_settings and not _may_fail_open:
                 return {
                     "final_response": (
                         "⚠️ Zenos Runtime preflight gagal dan profile ini dikonfigurasi fail-closed. "
@@ -20158,7 +20197,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                 except Exception as _zenos_postflight_error:
                     logger.exception("Zenos native postflight failed: %s", _zenos_postflight_error)
-                    if not bool((_zenos_settings or {}).get("fail_open", True)):
+                    _may_fail_open = False
+                    try:
+                        _may_fail_open = _zenos_runtime_failure_may_fail_open(
+                            _zenos_settings,
+                            message=_zenos_original_message,
+                            routing_hints=_zenos_routing_hints,
+                            preflight=_zenos_turn,
+                        )
+                    except Exception:
+                        _may_fail_open = False
+                    if not _may_fail_open:
                         response["final_response"] = (
                             "⚠️ Zenos Runtime postflight gagal dan profile ini dikonfigurasi fail-closed. "
                             f"Detail: {_zenos_postflight_error}"
