@@ -1458,7 +1458,26 @@ class GatewaySlashCommandsMixin:
         self._evict_cached_agent(session_key)
 
     async def _handle_wmodel_command(self, event: MessageEvent) -> Optional[str]:
-        """Manage staged Zenos Runtime Host/Worker/Boss models per chat session."""
+        """Compatibility alias for the unified Hermes/Runtime model selector."""
+        raw_args = event.get_command_args().strip()
+        if raw_args:
+            try:
+                tokens = shlex.split(raw_args)
+            except ValueError as exc:
+                return f"Model error: {exc}"
+            if tokens and tokens[0].lower() == "combo":
+                if len(tokens) != 2:
+                    return "Usage: /wmodel combo <router-combo-name>"
+                raw_args = f"{shlex.quote(tokens[1])} --provider etla-router"
+        forwarded = dataclasses.replace(
+            event,
+            text=f"/model {raw_args}".rstrip(),
+        )
+        return await self._handle_model_command(forwarded)
+
+        # Legacy multi-role implementation retained below for one release as
+        # rollback-only code. It is intentionally unreachable: Hermes and
+        # Zenos Runtime now share one active model selection.
         from gateway.run import _load_gateway_config
         from gateway.zenos_runtime import (
             RUNTIME_ROLES,
