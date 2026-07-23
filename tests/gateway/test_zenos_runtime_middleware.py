@@ -207,6 +207,12 @@ def test_turn_usage_delta_separates_current_turn_from_session_totals():
     }
 
 
+def test_middleware_settings_default_to_no_user_visible_execution_receipt():
+    settings = middleware_settings({"zenos_runtime": {"enabled": True}})
+
+    assert settings["receipt"] == "off"
+
+
 def test_middleware_settings_are_fail_open_and_bounded():
     settings = middleware_settings({
         "zenos_runtime": {

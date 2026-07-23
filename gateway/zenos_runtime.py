@@ -261,7 +261,10 @@ def middleware_settings(config: Mapping[str, Any] | None) -> Dict[str, Any]:
         "fail_open": bool(section.get("fail_open", True)),
         "fail_closed_mutations": bool(section.get("fail_closed_mutations", True)),
         "continuity_packet_v2": bool(section.get("continuity_packet_v2", True)),
-        "receipt": str(section.get("receipt") or "concise").strip().lower(),
+        # Execution receipts remain available in the internal postflight payload
+        # and logs. They are not appended to normal user-facing messages unless
+        # an operator explicitly enables a debug receipt mode.
+        "receipt": str(section.get("receipt") or "off").strip().lower(),
         "timeout_seconds": min(
             max(float(section.get("timeout_seconds") or DEFAULT_MIDDLEWARE_TIMEOUT), 10.0),
             600.0,
