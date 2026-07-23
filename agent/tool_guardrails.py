@@ -24,6 +24,7 @@ IDEMPOTENT_TOOL_NAMES = frozenset(
         "web_search",
         "web_extract",
         "session_search",
+        "vision_analyze",
         "browser_snapshot",
         "browser_console",
         "browser_get_images",
@@ -186,6 +187,28 @@ def canonical_tool_args(args: Mapping[str, Any]) -> str:
     )
 
 
+_NON_RETRYABLE_VISION_FAILURE_MARKERS = (
+    "insufficient balance",
+    "insufficient credits",
+    "payment required",
+    "account tier is insufficient",
+    "authenticationerror",
+    "permissiondeniederror",
+    "invalid api key",
+    "unauthorized",
+    "error code: 401",
+    "error code: 403",
+)
+
+
+def _is_non_retryable_tool_failure(tool_name: str, result: str | None) -> bool:
+    """Return True when retrying the same provider path cannot make progress."""
+    if tool_name != "vision_analyze" or not result:
+        return False
+    lower = result[:2_000].lower()
+    return any(marker in lower for marker in _NON_RETRYABLE_VISION_FAILURE_MARKERS)
+
+
 def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]:
     """Safety-fallback classifier used only when callers don't pass ``failed``.
 
@@ -231,6 +254,7 @@ class ToolCallGuardrailController:
     def reset_for_turn(self) -> None:
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
         self._same_tool_failure_counts: dict[str, int] = {}
+        self._non_retryable_failures: set[str] = set()
         self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
         self._halt_decision: ToolGuardrailDecision | None = None
 
@@ -242,6 +266,23 @@ class ToolCallGuardrailController:
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
         if not self.config.hard_stop_enabled:
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
+
+        if tool_name in self._non_retryable_failures:
+            decision = ToolGuardrailDecision(
+                action="block",
+                code="non_retryable_tool_failure_block",
+                message=(
+                    f"Blocked {tool_name}: the provider rejected the previous call for "
+                    "authentication, quota, balance, or account-tier reasons. Retrying "
+                    "the same tool path cannot succeed; change provider/model or use a "
+                    "different strategy."
+                ),
+                tool_name=tool_name,
+                count=1,
+                signature=signature,
+            )
+            self._halt_decision = decision
+            return decision
 
         exact_count = self._exact_failure_counts.get(signature, 0)
         if exact_count >= self.config.exact_failure_block_after:
@@ -302,6 +343,22 @@ class ToolCallGuardrailController:
 
             same_count = self._same_tool_failure_counts.get(tool_name, 0) + 1
             self._same_tool_failure_counts[tool_name] = same_count
+
+            if _is_non_retryable_tool_failure(tool_name, result):
+                self._non_retryable_failures.add(tool_name)
+                if self.config.warnings_enabled:
+                    return ToolGuardrailDecision(
+                        action="warn",
+                        code="non_retryable_tool_failure_warning",
+                        message=(
+                            f"{tool_name} was rejected for authentication, quota, balance, "
+                            "or account-tier reasons. Do not retry this provider path; switch "
+                            "provider/model or use another strategy."
+                        ),
+                        tool_name=tool_name,
+                        count=1,
+                        signature=signature,
+                    )
 
             if self.config.hard_stop_enabled and same_count >= self.config.same_tool_failure_halt_after:
                 decision = ToolGuardrailDecision(

@@ -167,6 +167,31 @@ def test_same_tool_varying_args_warns_by_default_without_halting():
     assert controller.halt_decision is None
 
 
+def test_non_retryable_vision_provider_failure_blocks_the_next_retry():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True)
+    )
+    first_args = {"image_url": "/tmp/one.png", "question": "read it"}
+    first = controller.after_call(
+        "vision_analyze",
+        first_args,
+        '{"success":false,"error":"Error code: 401 - Insufficient balance"}',
+        failed=True,
+    )
+
+    assert first.action == "warn"
+    assert first.code == "non_retryable_tool_failure_warning"
+
+    second = controller.before_call(
+        "vision_analyze",
+        {"image_url": "/tmp/two.png", "question": "try another screenshot"},
+    )
+    assert second.action == "block"
+    assert second.code == "non_retryable_tool_failure_block"
+    assert "change provider/model" in second.message
+    assert controller.halt_decision == second
+
+
 def test_hard_stop_enabled_halts_same_tool_varying_args_failure_streak():
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(

@@ -3578,6 +3578,22 @@ class TestParallelScopePathNormalization:
 
         assert not _should_parallelize_tool_batch([tc1, tc2])
 
+    def test_vision_calls_are_serial_even_for_different_images(self):
+        from run_agent import _should_parallelize_tool_batch
+
+        tc1 = _mock_tool_call(
+            name="vision_analyze",
+            arguments='{"image_url":"/tmp/one.png","question":"read it"}',
+            call_id="v1",
+        )
+        tc2 = _mock_tool_call(
+            name="vision_analyze",
+            arguments='{"image_url":"/tmp/two.png","question":"read it"}',
+            call_id="v2",
+        )
+
+        assert not _should_parallelize_tool_batch([tc1, tc2])
+
 
 class TestMcpParallelToolBatch:
     """Integration test: _should_parallelize_tool_batch respects MCP parallel flag."""
