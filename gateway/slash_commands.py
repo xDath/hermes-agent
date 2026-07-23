@@ -1739,16 +1739,25 @@ class GatewaySlashCommandsMixin:
         # (#30479).
         source = await asyncio.to_thread(self._normalize_source_for_session_key, source)
         session_key = self._session_key_for_source(source)
-        from gateway.zenos_runtime import runtime_session_id, save_runtime_host
+        from gateway.zenos_runtime import (
+            runtime_session_id,
+            save_runtime_default_host,
+            save_runtime_host,
+        )
         _runtime_session_id = runtime_session_id(session_key)
 
         async def _sync_runtime_host(model: str, provider: str) -> None:
             try:
+                if persist_global:
+                    await asyncio.to_thread(
+                        save_runtime_default_host, model, provider
+                    )
                 await asyncio.to_thread(
                     save_runtime_host, _runtime_session_id, model, provider
                 )
             except Exception as exc:
-                logger.debug("Runtime Host model sync failed: %s", exc)
+                logger.warning("Unified Runtime model sync failed: %s", exc)
+                raise
 
         override = self._session_model_overrides.get(session_key, {})
         if override:

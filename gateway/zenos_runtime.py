@@ -227,6 +227,16 @@ def save_runtime_host(session_id: str, model: str, provider: str) -> Dict[str, A
     )
 
 
+def save_runtime_default_host(model: str, provider: str) -> Dict[str, Any]:
+    """Persist the one global Hermes/Runtime model selection."""
+    return _json_request(
+        f"{_runtime_url()}/api/runtime/models",
+        api_key=_runtime_key(),
+        method="POST",
+        body={"hostModel": model, "hostProvider": provider},
+    )
+
+
 def list_runtime_combos() -> List[Dict[str, Any]]:
     base = os.getenv("NINE_ROUTER_URL", DEFAULT_ROUTER_URL).rstrip("/")
     data = _json_request(f"{base}/api/zenos-runtime/combos")

@@ -21,10 +21,26 @@ from gateway.zenos_runtime import (
     restore_host_working_set_limit,
     runtime_failure_may_fail_open,
     runtime_session_id,
+    save_runtime_default_host,
     structured_execution_receipts,
     usage_delta,
     workspace_root_from_text,
 )
+
+
+def test_global_model_selection_persists_to_the_runtime_default_endpoint():
+    with patch("gateway.zenos_runtime._runtime_url", return_value="http://runtime.test"), \
+         patch("gateway.zenos_runtime._runtime_key", return_value="runtime-key"), \
+         patch("gateway.zenos_runtime._json_request", return_value={"ok": True}) as request:
+        result = save_runtime_default_host("grok", "etla-router")
+
+    assert result == {"ok": True}
+    request.assert_called_once_with(
+        "http://runtime.test/api/runtime/models",
+        api_key="runtime-key",
+        method="POST",
+        body={"hostModel": "grok", "hostProvider": "etla-router"},
+    )
 
 
 def test_postflight_payload_omits_unavailable_optional_workspace_state():
