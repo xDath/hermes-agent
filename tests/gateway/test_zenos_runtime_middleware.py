@@ -287,6 +287,39 @@ def test_runtime_failure_only_fails_open_for_read_only_low_risk_work():
     ) is True
 
 
+def test_postflight_failure_uses_execution_evidence_not_lexical_false_positive():
+    settings = {"fail_open": True, "fail_closed_mutations": True}
+    preflight = {"decision": {"taskType": "coding_change", "requiresApproval": False}}
+
+    assert runtime_failure_may_fail_open(
+        settings,
+        message="Screenshot profile akun dan pertanyaan login buat Gmail",
+        routing_hints={"intent": "mutate", "hasCodeChangeIntent": True},
+        preflight=preflight,
+        execution_receipts=[{
+            "kind": "tool",
+            "status": "passed",
+            "changedFiles": [],
+            "metadata": {"mutating": False},
+        }],
+        workspace_before=None,
+        workspace_after=None,
+    ) is True
+
+    assert runtime_failure_may_fail_open(
+        settings,
+        message="Apply the requested repository change",
+        routing_hints={"intent": "mutate", "hasCodeChangeIntent": True},
+        preflight=preflight,
+        execution_receipts=[{
+            "kind": "workspace",
+            "status": "passed",
+            "changedFiles": ["src/app.ts"],
+            "metadata": {"mutating": True},
+        }],
+    ) is False
+
+
 def test_runtime_host_override_is_applied_only_when_authority_is_enabled():
     preflight = {
         "hostOverride": {"model": "deepseek", "provider": "etla-router"},
@@ -438,6 +471,17 @@ def test_infer_turn_context_marks_code_mutation_and_live_verification_hints():
     assert context["intent"] in {"execute", "mutate"}
 
 
+def test_infer_turn_context_does_not_match_code_terms_inside_ordinary_words():
+    context = infer_turn_context(
+        "Ini screenshot profile akun. Itu login buat Gmail, kena scam bro.",
+        workspace_root="/srv/etla/workspaces/zenos-runtime",
+    )
+
+    assert context["hasFiles"] is False
+    assert context["hasCodeChangeIntent"] is False
+    assert context["intent"] == "analyze"
+
+
 def test_infer_turn_context_understands_indonesian_live_verification_phrasing():
     context = infer_turn_context("yang live cobain diverifikasi dulu")
 
@@ -492,6 +536,21 @@ def test_infer_turn_context_marks_explicit_boss_requests_without_matching_casual
 
     assert requested["userRequestedBoss"] is True
     assert casual["userRequestedBoss"] is False
+
+
+def test_workspace_execution_receipt_omits_missing_revision_instead_of_sending_null():
+    receipts = structured_execution_receipts(
+        [],
+        workspace_before=None,
+        workspace_after={
+            "dirtyDiffSha256": "b" * 64,
+            "changedFiles": [{"path": "src/app.ts", "exists": True}],
+        },
+    )
+
+    workspace = next(receipt for receipt in receipts if receipt["kind"] == "workspace")
+    assert "workspaceRevisionBefore" not in workspace
+    assert workspace["workspaceRevisionAfter"] == "b" * 64
 
 
 def test_execution_receipt_exposes_real_role_invocation_and_skips():

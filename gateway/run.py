@@ -17070,7 +17070,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
             _zenos_settings = _zenos_middleware_settings(user_config)
-            if _zenos_settings.get("enabled"):
+            if _zenos_settings.get("enabled") and str(message or "").strip():
                 _zenos_host_model, _zenos_host_runtime = await asyncio.to_thread(
                     self._resolve_session_agent_runtime,
                     source=source,
@@ -17133,13 +17133,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             previous_checkpoint_id=str(_checkpoint_cache.get(_runtime_id) or ""),
                         )
                 _preflight_payload = {
-                    "request": message,
+                    "request": str(message or "").strip()[:100_000],
                     "sessionId": _runtime_id,
                     "turnId": _turn_id,
                     "platform": source.platform.value if source.platform else "gateway",
                     "host": {
-                        "model": str(_zenos_host_model or "unknown"),
-                        "provider": _zenos_host_provider,
+                        "model": str(_zenos_host_model or "unknown")[:500],
+                        "provider": str(_zenos_host_provider or "default")[:200],
                     },
                     "context": _zenos_compact_history(
                         history,
@@ -17232,8 +17232,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _zenos_settings and not _may_fail_open:
                 return {
                     "final_response": (
-                        "⚠️ Zenos Runtime preflight gagal dan profile ini dikonfigurasi fail-closed. "
-                        f"Detail: {_zenos_preflight_error}"
+                        "Zenos menahan task ini karena policy/validation Runtime sedang tidak tersedia. "
+                        "Coba kirim ulang setelah service pulih."
                     ),
                     "messages": [],
                     "api_calls": 0,
@@ -20068,10 +20068,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "sessionId": str((_zenos_turn or {}).get("sessionId") or ""),
                         "runId": str((_zenos_turn or {}).get("runId") or ""),
                         "turnId": str((_zenos_turn or {}).get("turnId") or ""),
-                        "draft": _candidate_answer,
+                        "draft": _candidate_answer[:200_000],
                         "host": {
-                            "model": str(response.get("model") or _zenos_host_model or "unknown"),
-                            "provider": _zenos_host_provider or "default",
+                            "model": str(response.get("model") or _zenos_host_model or "unknown")[:500],
+                            "provider": str(_zenos_host_provider or "default")[:200],
                         },
                         "toolSummary": _zenos_bounded_tool_summary(
                             _execution_messages,
@@ -20086,15 +20086,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "cacheReadTokens": max(0, int(_turn_usage.get("cacheReadTokens") or 0)),
                             "cacheWriteTokens": max(0, int(_turn_usage.get("cacheWriteTokens") or 0)),
                             "reasoningTokens": max(0, int(_turn_usage.get("reasoningTokens") or 0)),
-                            "calls": max(0, int(response.get("api_calls") or 0)),
-                            "source": str(_turn_usage.get("source") or "hermes-session-delta"),
+                            "calls": min(500, max(0, int(response.get("api_calls") or 0))),
+                            "source": str(_turn_usage.get("source") or "hermes-session-delta")
+                            if str(_turn_usage.get("source") or "hermes-session-delta") in {"provider", "estimate", "hermes-session-delta"}
+                            else "hermes-session-delta",
                             "valid": bool(_turn_usage.get("valid", True)),
                             "invalidReason": str(_turn_usage.get("invalidReason") or ""),
                             "providerRequestId": str(_turn_usage.get("providerRequestId") or ""),
                         },
-                        "hostDurationMs": max(
-                            0,
-                            int((time.time() - _notify_start) * 1000),
+                        "hostDurationMs": min(
+                            86_400_000,
+                            max(0, int((time.time() - _notify_start) * 1000)),
                         ),
                     }
                     # Runtime schemas distinguish an omitted optional object from
@@ -20204,13 +20206,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             message=_zenos_original_message,
                             routing_hints=_zenos_routing_hints,
                             preflight=_zenos_turn,
+                            execution_receipts=_execution_receipts,
+                            workspace_before=_zenos_workspace_state_before,
+                            workspace_after=_workspace_state_after,
                         )
                     except Exception:
                         _may_fail_open = False
                     if not _may_fail_open:
                         response["final_response"] = (
-                            "⚠️ Zenos Runtime postflight gagal dan profile ini dikonfigurasi fail-closed. "
-                            f"Detail: {_zenos_postflight_error}"
+                            "Zenos menahan hasil task ini karena bukti mutasi/validation tidak dapat diverifikasi. "
+                            "Tidak ada perubahan berisiko yang akan dianggap selesai."
                         )
                         response["failed"] = True
                         response["response_transformed"] = True

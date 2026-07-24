@@ -110,10 +110,23 @@ def _json_request(
     except urllib.error.HTTPError as exc:
         payload = exc.read().decode("utf-8", errors="replace")
         try:
-            detail = json.loads(payload).get("error") or payload
+            parsed = json.loads(payload)
+            detail = str(parsed.get("error") or payload)
+            issues = parsed.get("issues")
+            if isinstance(issues, list) and issues:
+                issue_text = "; ".join(
+                    f"{str(item.get('path') or '<root>')}: {str(item.get('message') or 'invalid')}"
+                    for item in issues[:8]
+                    if isinstance(item, Mapping)
+                )
+                if issue_text:
+                    detail = f"{detail} ({issue_text})"
+            request_id = str(parsed.get("requestId") or "").strip()
+            if request_id:
+                detail = f"{detail} [requestId={request_id}]"
         except Exception:
             detail = payload
-        raise RuntimeError(f"Zenos request failed ({exc.code}): {detail[:500]}") from exc
+        raise RuntimeError(f"Zenos request failed ({exc.code}): {detail[:1200]}") from exc
     except (urllib.error.URLError, TimeoutError) as exc:
         raise RuntimeError(f"Zenos service unavailable: {exc}") from exc
 
@@ -298,7 +311,7 @@ def middleware_settings(config: Mapping[str, Any] | None) -> Dict[str, Any]:
         "disable_streaming_when_verified": bool(
             section.get("disable_streaming_when_verified", True)
         ),
-        "report_failures": bool(section.get("report_failures", True)),
+        "report_failures": bool(section.get("report_failures", False)),
         "authoritative_host": bool(section.get("authoritative_host", True)),
         # Hermes is a tool-using agent loop, not a single inference call. Runtime
         # budgets remain useful for accounting and postflight decisions, but
@@ -316,6 +329,9 @@ def runtime_failure_may_fail_open(
     message: str = "",
     routing_hints: Mapping[str, Any] | None = None,
     preflight: Mapping[str, Any] | None = None,
+    execution_receipts: Sequence[Mapping[str, Any]] | None = None,
+    workspace_before: Mapping[str, Any] | None = None,
+    workspace_after: Mapping[str, Any] | None = None,
 ) -> bool:
     """Return whether Runtime failure may release an unverified Host response.
 
@@ -328,6 +344,24 @@ def runtime_failure_may_fail_open(
         return False
     if not bool(settings.get("fail_closed_mutations", True)):
         return True
+
+    # Postflight has concrete execution evidence. A lexical routing false
+    # positive must not replace a valid Host answer with a middleware warning.
+    # Keep fail-closed only when a real workspace/tool mutation or an explicit
+    # approval boundary is present.
+    if execution_receipts is not None or workspace_after is not None:
+        decision = preflight.get("decision") if isinstance(preflight, Mapping) else {}
+        requires_approval = bool((decision or {}).get("requiresApproval"))
+        before_revision = _workspace_revision(workspace_before)
+        after_revision = _workspace_revision(workspace_after)
+        workspace_mutated = bool(after_revision and before_revision != after_revision)
+        receipt_mutated = any(
+            bool((receipt.get("metadata") or {}).get("mutating"))
+            or bool(receipt.get("changedFiles"))
+            for receipt in (execution_receipts or [])
+            if isinstance(receipt, Mapping)
+        )
+        return not (requires_approval or workspace_mutated or receipt_mutated)
 
     hints = routing_hints if isinstance(routing_hints, Mapping) else {}
     decision = preflight.get("decision") if isinstance(preflight, Mapping) else {}
@@ -896,6 +930,25 @@ def restore_host_working_set_limit(agent: Any, state: Mapping[str, Any] | None) 
         setattr(agent, "_zenos_host_working_set_tokens", previous_working_set)
 
 
+def _contains_term(text: str, term: str) -> bool:
+    """Match routing vocabulary as tokens/phrases, never raw substrings.
+
+    Raw substring checks made ordinary words such as ``profile`` match
+    ``file`` and Indonesian chat such as ``buat Gmail`` look like a source-code
+    mutation. Phrase-aware boundaries keep routing conservative without losing
+    multi-word intents such as ``stack trace`` or ``update service``.
+    """
+    normalized = str(term or "").strip().lower()
+    if not normalized:
+        return False
+    phrase = r"\s+".join(re.escape(part) for part in normalized.split())
+    return bool(re.search(rf"(?<![\w]){phrase}(?![\w])", str(text or "").lower(), re.UNICODE))
+
+
+def _contains_any_term(text: str, terms: Sequence[str]) -> bool:
+    return any(_contains_term(text, term) for term in terms)
+
+
 def infer_turn_context(
     message: str,
     *,
@@ -913,7 +966,7 @@ def infer_turn_context(
         + len(str(item.get("tool_name") or ""))
         for item in history_items
     )
-    estimated_tokens = max(1, (len(text) + history_chars) // 4)
+    estimated_tokens = min(2_000_000, max(1, (len(text) + history_chars) // 4))
     code_terms = (
         "code", "coding", "repo", "repository", "file", "function", "class",
         "bug", "error", "stack trace", "typescript", "javascript", "python",
@@ -949,8 +1002,8 @@ def infer_turn_context(
         "jalankan", "run ", "deploy", "restart", "push", "commit", "hapus",
         "delete", "kirim", "send", "install", "update service",
     )
-    has_code = any(term in lower for term in code_terms)
-    has_mutation = any(term in lower for term in mutation_terms)
+    has_code = _contains_any_term(lower, code_terms)
+    has_mutation = _contains_any_term(lower, mutation_terms)
     # Short acknowledgements such as "Gas" are common continuation commands.
     # Preserve the active coding intent only when recent history contains both
     # code evidence and an explicitly unfinished mutation, so casual chat does
@@ -970,9 +1023,9 @@ def infer_turn_context(
     )
     continuation_code_change = (
         is_short_continuation
-        and any(term in recent_history for term in code_terms)
-        and any(term in recent_history for term in mutation_terms)
-        and any(term in recent_history for term in unfinished_terms)
+        and _contains_any_term(recent_history, code_terms)
+        and _contains_any_term(recent_history, mutation_terms)
+        and _contains_any_term(recent_history, unfinished_terms)
     )
     if continuation_code_change:
         has_code = True
@@ -980,25 +1033,25 @@ def infer_turn_context(
     intent = "analyze"
     if continuation_code_change:
         intent = "mutate"
-    elif any(term in lower for term in execute_terms):
+    elif _contains_any_term(lower, execute_terms):
         intent = "execute"
     elif has_code and has_mutation:
         intent = "mutate"
-    elif any(term in lower for term in ("rencana", "plan", "arsitektur", "design")):
+    elif _contains_any_term(lower, ("rencana", "plan", "arsitektur", "design")):
         intent = "plan"
-    elif any(term in lower for term in ("jelasin", "jelaskan", "apa itu", "explain")):
+    elif _contains_any_term(lower, ("jelasin", "jelaskan", "apa itu", "explain")):
         intent = "explain"
     return {
         "hasFiles": bool(workspace_root and has_code),
-        "hasLogs": any(term in lower for term in log_terms),
+        "hasLogs": _contains_any_term(lower, log_terms),
         "hasCodeChangeIntent": bool(has_code and has_mutation),
-        "userRequestedVerification": any(term in lower for term in verification_terms),
-        "userRequestedBoss": any(term in lower for term in boss_request_terms),
+        "userRequestedVerification": _contains_any_term(lower, verification_terms),
+        "userRequestedBoss": _contains_any_term(lower, boss_request_terms),
         "estimatedContextTokens": estimated_tokens,
         "confidence": 0.75,
         "intent": intent,
         "containsUntrustedInput": False,
-        "requiresFreshData": any(term in lower for term in fresh_terms),
+        "requiresFreshData": _contains_any_term(lower, fresh_terms),
     }
 
 
@@ -1493,7 +1546,7 @@ def structured_execution_receipts(
             "summary": "Hermes workspace snapshot changed during this Host cycle.",
             "changedFiles": after_files,
             "artifactIds": [],
-            "workspaceRevisionBefore": before_revision or None,
+            **({"workspaceRevisionBefore": before_revision} if before_revision else {}),
             "workspaceRevisionAfter": after_revision,
             "metadata": {"mutating": True},
         })
